@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: mrdserver
+Version: 0.1.0
+Summary: ISMRMRD/MRD streaming reconstruction server
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: ismrmrd>=1.14.1
+Requires-Dist: pydicom
+Requires-Dist: h5py
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Provides-Extra: yaml
+Requires-Dist: pyyaml; extra == "yaml"
+Provides-Extra: xml
+Requires-Dist: xmltodict; extra == "xml"
+Dynamic: license-file

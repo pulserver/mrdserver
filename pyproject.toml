@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mrdserver"
+version = "0.1.0"
+description = "ISMRMRD/MRD streaming reconstruction server"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "ismrmrd>=1.14.1",
+    "pydicom",
+    "h5py",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+yaml = ["pyyaml"]
+xml = ["xmltodict"]
+
+[project.scripts]
+mrdserver = "mrdserver.main:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]

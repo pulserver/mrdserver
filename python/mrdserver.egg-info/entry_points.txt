@@ -1,0 +1,2 @@
+[console_scripts]
+mrdserver = mrdserver.main:main
