@@ -64,15 +64,17 @@ void skip_ints(std::ifstream& f, int count) {
     if (!f.good()) throw std::runtime_error("unexpected EOF skipping ints");
 }
 
-// ---------- read rotation matrices from GENINSTRUCTIONS (section 2) ----------
+// ---------- read descriptor data from GENINSTRUCTIONS (section 2) ----------
 
 std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
-    std::ifstream& f, long section_offset, int section_size, bool do_swap)
+    std::ifstream& f, long section_offset, int section_size, bool do_swap,
+    TrajectoryCache& cache)
 {
     std::vector<std::array<float, 9>> rotations;
 
     f.seekg(section_offset, std::ios::beg);
     if (!f.good()) throw std::runtime_error("cannot seek to GENINSTRUCTIONS");
+    (void)section_size;
 
     // First, skip the collection-level header (6 ints):
     //   num_subsequences, num_repetitions, total_unique_segments,
@@ -100,16 +102,8 @@ std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
 
         // --- RF definitions ---
         int num_unique_rfs = read_int(f, do_swap);
-        // each RF def: 6 ints + 13 floats (stats) = 19 fields (but stats has 11 float + 2 int...)
-        // Actually: id, mag_shape_id, phase_shape_id, time_shape_id, delay, num_channels (6 ints)
-        // then rf_stats: 8 float + 1 int + 2 float + 1 int + 1 int = 13 x 4 bytes
-        // Total: 6 + 13 = 19 fields per rf_def (but let's check)
-        // rf_stats: flip_angle_deg(f), act_amplitude_hz(f), area(f), abs_width(f),
-        //   eff_width(f), duty_cycle(f), max_pulse_width(f), duration_us(f),
-        //   isodelay_us(i), bandwidth_hz(f), base_amplitude_hz(f),
-        //   num_samples(i), num_instances(i) = 13 fields
-        // rf_def: 6 + 13 = 19 fields
-        skip_ints(f, num_unique_rfs * 19);
+        // per rf_def: 6 scalars + 11 from rf_stats = 17 fields
+        skip_ints(f, num_unique_rfs * 17);
 
         // --- RF table ---
         int rf_table_size = read_int(f, do_swap);
@@ -118,17 +112,8 @@ std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
 
         // --- Grad definitions ---
         int num_unique_grads = read_int(f, do_swap);
-        // per grad_def: 8 ints + 7 * MAX_GRAD_SHOTS floats
-        //   id, type, rise_time_or_unused, flat_time_or_unused,
-        //   fall_time_or_num_uncompressed_samples, unused_or_time_shape_id,
-        //   delay, num_shots (8 ints)
-        //   shot_shape_ids[16] (16 ints), max_amplitude[16], min_amplitude[16],
-        //   slew_rate[16], energy[16], first_value[16], last_value[16]
-        //   = 8 + 16 + 6*16 = 8 + 16 + 96 = 120 fields
-        // Wait, shot_shape_ids is int[16], that's 16 ints.
-        // max_amplitude..last_value are 6 * float[16] = 96 floats
-        // Total: 8 + 16 + 96 = 120 fields per grad_def
-        skip_ints(f, num_unique_grads * 120);
+        // per grad_def: 8 + MAX_GRAD_SHOTS + 6*MAX_GRAD_SHOTS = 120 fields
+        skip_ints(f, num_unique_grads * (8 + 7 * MAX_GRAD_SHOTS));
 
         // --- Grad table ---
         int grad_table_size = read_int(f, do_swap);
@@ -158,7 +143,7 @@ std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
             skip_ints(f, nch * 2);  // magnitudes[nch] + phases[nch]
         }
 
-        // --- Rotations (THIS IS WHAT WE WANT) ---
+        // --- Rotations ---
         int num_rotations = read_int(f, do_swap);
         rotations.resize(static_cast<size_t>(num_rotations));
         for (int r = 0; r < num_rotations; ++r) {
@@ -167,7 +152,101 @@ std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
             if (do_swap) swap4_array(rotations[r].data(), 9);
         }
 
-        // Only read first subsequence's rotations
+        // --- Triggers ---
+        int num_triggers = read_int(f, do_swap);
+        skip_ints(f, num_triggers * 5);
+
+        // --- Shapes ---
+        int num_shapes = read_int(f, do_swap);
+        for (int sh = 0; sh < num_shapes; ++sh) {
+            skip_ints(f, 1);  // num_uncompressed_samples
+            int ns = read_int(f, do_swap);
+            if (ns > 0) skip_ints(f, ns);
+        }
+
+        // --- TR descriptor (10 fields) ---
+        skip_ints(f, 10);
+
+        // --- Segment definitions ---
+        {
+            int num_segs_def = read_int(f, do_swap);
+            for (int sg = 0; sg < num_segs_def; ++sg) {
+                skip_ints(f, 1);  // start_block
+                int seg_nblocks = read_int(f, do_swap);
+                skip_ints(f, 1);  // max_energy_start_block
+                if (seg_nblocks > 0)
+                    skip_ints(f, seg_nblocks * 5);  // 5 arrays × num_blocks
+                skip_ints(f, 2);  // trigger_id, is_nav
+            }
+        }
+
+        // --- Segment table ---
+        {
+            skip_ints(f, 1);  // num_unique_segments (redundant)
+            int n_prep = read_int(f, do_swap);
+            if (n_prep > 0) skip_ints(f, n_prep);
+            int n_main = read_int(f, do_swap);
+            if (n_main > 0) skip_ints(f, n_main);
+            int n_cool = read_int(f, do_swap);
+            if (n_cool > 0) skip_ints(f, n_cool);
+        }
+
+        // --- Label table (skip: written with fwrite, same 4-byte fields) ---
+        {
+            int label_cols = read_int(f, do_swap);
+            int label_rows = read_int(f, do_swap);
+            if (label_rows > 0 && label_cols > 0)
+                skip_ints(f, label_rows * label_cols);
+        }
+
+        // --- Label limits (10 × {min, max} = 20 ints) ---
+        {
+            LabelLimit ll[10];
+            if (!read4(f, ll, 20))
+                throw std::runtime_error("EOF reading label_limits");
+            if (do_swap) swap4_array(ll, 20);
+            cache.label_limits.slc = ll[0];
+            cache.label_limits.phs = ll[1];
+            cache.label_limits.rep = ll[2];
+            cache.label_limits.avg = ll[3];
+            cache.label_limits.seg = ll[4];
+            cache.label_limits.set = ll[5];
+            cache.label_limits.eco = ll[6];
+            cache.label_limits.par = ll[7];
+            cache.label_limits.lin = ll[8];
+            cache.label_limits.acq = ll[9];
+        }
+
+        // --- Generic definitions ---
+        {
+            int num_defs = read_int(f, do_swap);
+            for (int d = 0; d < num_defs; ++d) {
+                // name: length-prefixed string (not null-terminated in file)
+                int name_len = read_int(f, do_swap);
+                std::string name(static_cast<size_t>(name_len), '\0');
+                f.read(&name[0], name_len);
+                if (!f.good()) throw std::runtime_error("EOF reading definition name");
+
+                int value_size = read_int(f, do_swap);
+                std::vector<std::string> values(static_cast<size_t>(value_size));
+                for (int v = 0; v < value_size; ++v) {
+                    int vlen = read_int(f, do_swap);
+                    values[v].resize(static_cast<size_t>(vlen));
+                    f.read(&values[v][0], vlen);
+                    if (!f.good()) throw std::runtime_error("EOF reading definition value");
+                }
+                cache.definitions[std::move(name)] = std::move(values);
+            }
+        }
+
+        // --- Scan table (skip) ---
+        {
+            int scan_len = read_int(f, do_swap);
+            if (scan_len > 0)
+                skip_ints(f, scan_len * 3);  // block_idx, tr_id, seg_id
+        }
+
+        // Only read first subsequence
         break;
     }
 
@@ -203,7 +282,7 @@ TrajectoryCache read_trajectory_cache(const std::string& cache_path)
     int stored_size   = read_int(f, do_swap);
     int num_sections  = read_int(f, do_swap);
 
-    (void)version_minor; (void)vendor; (void)stored_size;
+    (void)version_major; (void)version_minor; (void)vendor; (void)stored_size;
 
     if (num_sections <= 0 || num_sections > 16)
         throw std::runtime_error("invalid cache: bad num_sections");
@@ -227,10 +306,11 @@ TrajectoryCache read_trajectory_cache(const std::string& cache_path)
 
     if (!traj_section) return cache;  // no trajectory data
 
-    // Read rotation matrices from GENINSTRUCTIONS
+    // Read rotation matrices, label_limits, definitions from GENINSTRUCTIONS
     if (geninst_section) {
         cache.rotations = read_rotations_from_geninstructions(
-            f, geninst_section->offset, geninst_section->size, do_swap);
+            f, geninst_section->offset, geninst_section->size, do_swap,
+            cache);
     }
 
     // Read trajectory section
@@ -291,9 +371,114 @@ TrajectoryCache read_trajectory_cache(const std::string& cache_path)
         e.lin = read_int(f, do_swap);
         e.par = read_int(f, do_swap);
         e.acq = read_int(f, do_swap);
+        // New fields: flags (2 ints), center_sample, sample_time_us, encoding_space_ref
+        {
+            uint32_t flags_lo = static_cast<uint32_t>(read_int(f, do_swap));
+            uint32_t flags_hi = static_cast<uint32_t>(read_int(f, do_swap));
+            e.flags = (static_cast<uint64_t>(flags_hi) << 32) | static_cast<uint64_t>(flags_lo);
+        }
+        e.center_sample      = read_int(f, do_swap);
+        e.sample_time_us     = read_float(f, do_swap);
+        e.encoding_space_ref = read_int(f, do_swap);
     }
 
     return cache;
+}
+
+std::vector<PrecomputedTrajectory> pre_compute_trajectories(const TrajectoryCache& cache)
+{
+    const int num_es = static_cast<int>(cache.encoding_spaces.size());
+    std::vector<PrecomputedTrajectory> result(static_cast<size_t>(num_es));
+
+    for (int es = 0; es < num_es; ++es) {
+        // Collect ADC indices for this encoding space
+        std::vector<int> adc_indices;
+        for (int t = 0; t < static_cast<int>(cache.table.size()); ++t) {
+            if (cache.table[t].encoding_space_ref == es)
+                adc_indices.push_back(t);
+        }
+        if (adc_indices.empty()) continue;
+
+        // Determine num_samples from the first ADC's kshot
+        const auto& first = cache.table[adc_indices[0]];
+        int nsamples = 0;
+        if (first.kx_shot_id >= 0 && first.kx_shot_id < static_cast<int>(cache.kshots.size()))
+            nsamples = static_cast<int>(cache.kshots[first.kx_shot_id].k.size());
+        else if (first.ky_shot_id >= 0 && first.ky_shot_id < static_cast<int>(cache.kshots.size()))
+            nsamples = static_cast<int>(cache.kshots[first.ky_shot_id].k.size());
+        else if (first.kz_shot_id >= 0 && first.kz_shot_id < static_cast<int>(cache.kshots.size()))
+            nsamples = static_cast<int>(cache.kshots[first.kz_shot_id].k.size());
+        if (nsamples == 0) continue;
+
+        const int num_ro = static_cast<int>(adc_indices.size());
+        std::vector<float> kx_all(static_cast<size_t>(nsamples) * num_ro, 0.0f);
+        std::vector<float> ky_all(static_cast<size_t>(nsamples) * num_ro, 0.0f);
+        std::vector<float> kz_all(static_cast<size_t>(nsamples) * num_ro, 0.0f);
+
+        for (int r = 0; r < num_ro; ++r) {
+            const auto& entry = cache.table[adc_indices[r]];
+            float* px = &kx_all[static_cast<size_t>(r) * nsamples];
+            float* py = &ky_all[static_cast<size_t>(r) * nsamples];
+            float* pz = &kz_all[static_cast<size_t>(r) * nsamples];
+
+            auto compose = [&](int shot_id, float amp, float* dst) {
+                if (shot_id >= 0 && shot_id < static_cast<int>(cache.kshots.size())) {
+                    const auto& sk = cache.kshots[shot_id].k;
+                    for (int i = 0; i < std::min(nsamples, static_cast<int>(sk.size())); ++i)
+                        dst[i] = sk[i] * amp;
+                }
+            };
+            compose(entry.kx_shot_id, entry.gx_amplitude, px);
+            compose(entry.ky_shot_id, entry.gy_amplitude, py);
+            compose(entry.kz_shot_id, entry.gz_amplitude, pz);
+
+            if (entry.rotation_id >= 0 &&
+                entry.rotation_id < static_cast<int>(cache.rotations.size()))
+            {
+                const auto& R = cache.rotations[entry.rotation_id];
+                for (int i = 0; i < nsamples; ++i) {
+                    float rx = R[0]*px[i] + R[1]*py[i] + R[2]*pz[i];
+                    float ry = R[3]*px[i] + R[4]*py[i] + R[5]*pz[i];
+                    float rz = R[6]*px[i] + R[7]*py[i] + R[8]*pz[i];
+                    px[i] = rx; py[i] = ry; pz[i] = rz;
+                }
+            }
+        }
+
+        auto is_zero = [](const std::vector<float>& v) {
+            for (float f : v) if (f != 0.0f) return false;
+            return true;
+        };
+        bool has_x = !is_zero(kx_all);
+        bool has_y = !is_zero(ky_all);
+        bool has_z = !is_zero(kz_all);
+        int ndim = (has_x ? 1 : 0) + (has_y ? 1 : 0) + (has_z ? 1 : 0);
+        if (ndim == 0) continue; // Cartesian
+
+        auto& pt = result[es];
+        pt.ndim        = ndim;
+        pt.num_samples = nsamples;
+        pt.num_readouts = num_ro;
+        pt.data.resize(static_cast<size_t>(ndim) * nsamples * num_ro);
+
+        // Pack active axes: interleaved [ax0_s0, ax1_s0, ..., ax0_s1, ...]
+        for (int r = 0; r < num_ro; ++r) {
+            const float* axes[3] = {
+                has_x ? &kx_all[static_cast<size_t>(r) * nsamples] : nullptr,
+                has_y ? &ky_all[static_cast<size_t>(r) * nsamples] : nullptr,
+                has_z ? &kz_all[static_cast<size_t>(r) * nsamples] : nullptr
+            };
+            float* dst = &pt.data[static_cast<size_t>(r) * ndim * nsamples];
+            for (int s = 0; s < nsamples; ++s) {
+                int d = 0;
+                if (has_x) dst[s * ndim + d++] = axes[0][s];
+                if (has_y) dst[s * ndim + d++] = axes[1][s];
+                if (has_z) dst[s * ndim + d++] = axes[2][s];
+            }
+        }
+    }
+
+    return result;
 }
 
 } // namespace mrdserver
