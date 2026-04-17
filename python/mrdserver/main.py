@@ -73,6 +73,18 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Path to log file (in addition to stdout)",
     )
+    parser.add_argument(
+        "--rtp-port",
+        type=int,
+        default=None,
+        help="Port for the RTP PMC connection (disabled if not set)",
+    )
+    parser.add_argument(
+        "--rtp-handler",
+        type=str,
+        default="pmcrecon",
+        help="Handler module name for the RTP PMC connection",
+    )
 
     parser.set_defaults(**_DEFAULTS)
     args = parser.parse_args(argv)
@@ -102,7 +114,10 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=args.output_dir,
         save_data=args.save_data,
         handler_dirs=args.handler_dir,
+        rtp_port=args.rtp_port,
+        rtp_handler=args.rtp_handler,
     )
+    server.start_rtp_server()
     server.serve()
 
 

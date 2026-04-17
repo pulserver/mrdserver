@@ -17,6 +17,7 @@ import ismrmrd.xsd
 
 from . import constants
 from .connection import Connection
+from .rtp_connection import RtpServer
 
 
 class Server:
@@ -50,6 +51,8 @@ class Server:
         output_dir: str = "",
         save_data: bool = False,
         handler_dirs: list[str] | None = None,
+        rtp_port: int | None = None,
+        rtp_handler: str = "pmcrecon",
     ) -> None:
         self.host = host
         self.port = port
@@ -57,6 +60,9 @@ class Server:
         self.output_dir = output_dir
         self.save_data = save_data
         self.handler_dirs = handler_dirs or []
+        self.rtp_port = rtp_port
+        self.rtp_handler = rtp_handler
+        self._rtp_server: RtpServer | None = None
 
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -72,6 +78,27 @@ class Server:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def start_rtp_server(self) -> None:
+        """Start the RTP PMC server in a background daemon thread (if rtp_port is set)."""
+        if self.rtp_port is None:
+            return
+        handler_mod = self._try_import(self.rtp_handler)
+        for d in self.handler_dirs:
+            if handler_mod is not None:
+                break
+            import os
+            path = os.path.join(d, self.rtp_handler + ".py")
+            if os.path.isfile(path):
+                handler_mod = self._load_from_file(self.rtp_handler, path)
+        self._rtp_server = RtpServer(
+            host=self.host,
+            port=self.rtp_port,
+            handler_module=handler_mod,
+        )
+        self._rtp_server.serve_in_thread()
+        logging.info("RTP PMC server started on port %d (handler: %s)",
+                     self.rtp_port, self.rtp_handler)
 
     def serve(self) -> None:
         """Block and accept connections until interrupted."""

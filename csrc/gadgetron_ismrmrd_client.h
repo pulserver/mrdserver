@@ -51,6 +51,7 @@ enum GadgetronMessageID {
     GADGET_MESSAGE_ISMRMRD_IMAGE                          = 1022,
     GADGET_MESSAGE_RECONDATA                              = 1023,
     GADGET_MESSAGE_ISMRMRD_WAVEFORM                       = 1026,
+    GADGET_MESSAGE_PMC_PAYLOAD                            = 1027, /**< PMC correction: PmcPayload struct (7 x float32) */
     GADGET_MESSAGE_EXT_ID_MAX                             = 4096
 };
 
