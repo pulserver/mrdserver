@@ -14,7 +14,12 @@
 #include <fstream>
 #include <stdexcept>
 #include <cstring>
+#include <ctime>
 #include <algorithm>
+
+#include "ismrmrd/ismrmrd.h"
+#include "ismrmrd/version.h"
+#include "ismrmrd/waveform.h"
 
 namespace mrdserver {
 
@@ -199,22 +204,13 @@ std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
                 skip_ints(f, label_rows * label_cols);
         }
 
-        // --- Label limits (10 × {min, max} = 20 ints) ---
+        // --- Label limits (global, kept for backward compatibility but superseded by per-ES limits) ---
         {
             LabelLimit ll[10];
             if (!read4(f, ll, 20))
                 throw std::runtime_error("EOF reading label_limits");
-            if (do_swap) swap4_array(ll, 20);
-            cache.label_limits.slc = ll[0];
-            cache.label_limits.phs = ll[1];
-            cache.label_limits.rep = ll[2];
-            cache.label_limits.avg = ll[3];
-            cache.label_limits.seg = ll[4];
-            cache.label_limits.set = ll[5];
-            cache.label_limits.eco = ll[6];
-            cache.label_limits.par = ll[7];
-            cache.label_limits.lin = ll[8];
-            cache.label_limits.acq = ll[9];
+            // Consumed but not stored — per-encoding-space limits in TRAJECTORY section take precedence.
+            (void)ll;
         }
 
         // --- Generic definitions ---
@@ -341,6 +337,23 @@ TrajectoryCache read_trajectory_cache(const std::string& cache_path)
         if (!read4(f, es.nav_matrix, 3)) throw std::runtime_error("EOF reading encoding space");
         es.subseq_idx       = read_int(f, do_swap);
         es.nav_subseq_offset = read_int(f, do_swap);
+        // Per-encoding-space label limits (10 × {min,max} = 20 ints)
+        {
+            LabelLimit ll[10];
+            if (!read4(f, ll, 20))
+                throw std::runtime_error("EOF reading per-ES label_limits");
+            if (do_swap) swap4_array(ll, 20);
+            es.label_limits.slc = ll[0];
+            es.label_limits.phs = ll[1];
+            es.label_limits.rep = ll[2];
+            es.label_limits.avg = ll[3];
+            es.label_limits.seg = ll[4];
+            es.label_limits.set = ll[5];
+            es.label_limits.eco = ll[6];
+            es.label_limits.par = ll[7];
+            es.label_limits.lin = ll[8];
+            es.label_limits.acq = ll[9];
+        }
         if (do_swap) {
             swap4_array(es.fov, 3);
             swap4_array(es.matrix, 3);
@@ -408,7 +421,16 @@ std::vector<PrecomputedTrajectory> pre_compute_trajectories(const TrajectoryCach
             nsamples = static_cast<int>(cache.kshots[first.ky_shot_id].k.size());
         else if (first.kz_shot_id >= 0 && first.kz_shot_id < static_cast<int>(cache.kshots.size()))
             nsamples = static_cast<int>(cache.kshots[first.kz_shot_id].k.size());
-        if (nsamples == 0) continue;
+
+        // If no kshot data but rotation is present, synthesise a unit radial line along kx.
+        // The rotation matrix for each readout will orient the spoke to its actual direction.
+        bool synthetic_radial = false;
+        if (nsamples == 0) {
+            if (es < static_cast<int>(cache.encoding_spaces.size()))
+                nsamples = static_cast<int>(cache.encoding_spaces[es].matrix[0]);
+            if (nsamples == 0 || first.rotation_id < 0) continue;
+            synthetic_radial = true;
+        }
 
         const int num_ro = static_cast<int>(adc_indices.size());
         std::vector<float> kx_all(static_cast<size_t>(nsamples) * num_ro, 0.0f);
@@ -421,16 +443,25 @@ std::vector<PrecomputedTrajectory> pre_compute_trajectories(const TrajectoryCach
             float* py = &ky_all[static_cast<size_t>(r) * nsamples];
             float* pz = &kz_all[static_cast<size_t>(r) * nsamples];
 
-            auto compose = [&](int shot_id, float amp, float* dst) {
-                if (shot_id >= 0 && shot_id < static_cast<int>(cache.kshots.size())) {
-                    const auto& sk = cache.kshots[shot_id].k;
-                    for (int i = 0; i < std::min(nsamples, static_cast<int>(sk.size())); ++i)
-                        dst[i] = sk[i] * amp;
-                }
-            };
-            compose(entry.kx_shot_id, entry.gx_amplitude, px);
-            compose(entry.ky_shot_id, entry.gy_amplitude, py);
-            compose(entry.kz_shot_id, entry.gz_amplitude, pz);
+            if (synthetic_radial) {
+                // Unit line: [-0.5, 0.5] centred on center_sample, normalised by nsamples
+                const float center = static_cast<float>(entry.center_sample);
+                const float norm   = static_cast<float>(nsamples);
+                for (int i = 0; i < nsamples; ++i)
+                    px[i] = (static_cast<float>(i) - center) / norm;
+                // ky, kz remain zero — rotation will spread kx into the spoke direction
+            } else {
+                auto compose = [&](int shot_id, float amp, float* dst) {
+                    if (shot_id >= 0 && shot_id < static_cast<int>(cache.kshots.size())) {
+                        const auto& sk = cache.kshots[shot_id].k;
+                        for (int i = 0; i < std::min(nsamples, static_cast<int>(sk.size())); ++i)
+                            dst[i] = sk[i] * amp;
+                    }
+                };
+                compose(entry.kx_shot_id, entry.gx_amplitude, px);
+                compose(entry.ky_shot_id, entry.gy_amplitude, py);
+                compose(entry.kz_shot_id, entry.gz_amplitude, pz);
+            }
 
             if (entry.rotation_id >= 0 &&
                 entry.rotation_id < static_cast<int>(cache.rotations.size()))
@@ -479,6 +510,221 @@ std::vector<PrecomputedTrajectory> pre_compute_trajectories(const TrajectoryCach
     }
 
     return result;
+}
+
+void enrich_ismrmrd_header(ISMRMRD::IsmrmrdHeader& hdr, const TrajectoryCache& cache)
+{
+    // --- Sequence parameters from definitions ---
+    {
+        ISMRMRD::SequenceParameters seqp;
+        auto get_floats = [&](const char* key) -> std::vector<float> {
+            std::vector<float> out;
+            auto it = cache.definitions.find(key);
+            if (it != cache.definitions.end()) {
+                for (const auto& sv : it->second) {
+                    try { out.push_back(std::stof(sv)); } catch (...) {}
+                }
+            }
+            return out;
+        };
+        auto tr = get_floats("TR");
+        auto te = get_floats("TE");
+        auto ti = get_floats("TI");
+        auto fa = get_floats("FlipAngle");
+        if (!tr.empty()) seqp.TR = tr;
+        if (!te.empty()) seqp.TE = te;
+        if (!ti.empty()) seqp.TI = ti;
+        if (!fa.empty()) seqp.flipAngle_deg = fa;
+        // Only override if we actually have something to set
+        if (seqp.TR || seqp.TE || seqp.TI || seqp.flipAngle_deg)
+            hdr.sequenceParameters = seqp;
+    }
+
+    // --- Encoding limits, encodedSpace and reconSpace ---
+    // cache.encoding_spaces is the authoritative flat list: normal and
+    // navigator encoding spaces are already interleaved at the correct
+    // indices (encoding_space_ref values in the table use these directly).
+    // We map 1:1: hdr.encoding[i] ↔ cache.encoding_spaces[i].
+    if (!cache.encoding_spaces.empty()) {
+        const int num_es = static_cast<int>(cache.encoding_spaces.size());
+        if (static_cast<int>(hdr.encoding.size()) < num_es)
+            hdr.encoding.resize(static_cast<size_t>(num_es));
+
+        auto make_limit = [](const LabelLimit& ll) {
+            ISMRMRD::Limit lim;
+            lim.minimum = 0;
+            lim.maximum = static_cast<uint16_t>(ll.max);
+            lim.center  = static_cast<uint16_t>(ll.max / 2);
+            return lim;
+        };
+
+        // encodedSpace, reconSpace and encodingLimits: one entry per encoding space
+        for (int es = 0; es < num_es; ++es) {
+            const auto& ces = cache.encoding_spaces[es];
+            ISMRMRD::EncodingSpace space;
+            space.matrixSize.x     = static_cast<uint16_t>(ces.matrix[0]);
+            space.matrixSize.y     = static_cast<uint16_t>(ces.matrix[1]);
+            space.matrixSize.z     = static_cast<uint16_t>(ces.matrix[2]);
+            space.fieldOfView_mm.x = ces.fov[0];
+            space.fieldOfView_mm.y = ces.fov[1];
+            space.fieldOfView_mm.z = ces.fov[2];
+            hdr.encoding[es].encodedSpace = space;
+            hdr.encoding[es].reconSpace   = space;
+
+            const auto& ll = ces.label_limits;
+            auto& enc = hdr.encoding[es].encodingLimits;
+            enc.kspace_encoding_step_1 = make_limit(ll.lin);
+            enc.kspace_encoding_step_2 = make_limit(ll.par);
+            enc.slice                  = make_limit(ll.slc);
+            enc.average                = make_limit(ll.avg);
+            enc.contrast               = make_limit(ll.eco);
+            enc.phase                  = make_limit(ll.phs);
+            enc.repetition             = make_limit(ll.rep);
+            enc.set                    = make_limit(ll.set);
+            enc.segment                = make_limit(ll.seg);
+        }
+    }
+}
+
+void enrich_ismrmrd_acquisition(
+    ISMRMRD::Acquisition& acq,
+    int acquisition_index,
+    uint32_t measurement_uid,
+    float table_position_z,
+    const TrajectoryCache& cache,
+    const std::vector<PrecomputedTrajectory>& trajectories,
+    const std::vector<int>& readout_index_in_es,
+    const uint32_t* physio_stamps)
+{
+    // Scan-invariant fields not correctly populated by the GE converter
+    acq.measurement_uid() = measurement_uid;
+    acq.patient_table_position()[0] = 0.0f;
+    acq.patient_table_position()[1] = 0.0f;
+    acq.patient_table_position()[2] = table_position_z;
+
+    // acquisition_time_stamp: ISMRMRD convention is ms since midnight;
+    // the GE converter sets time(NULL) (seconds since epoch)
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    acq.acquisition_time_stamp() =
+        static_cast<uint32_t>((t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec) * 1000);
+
+    // Physiological trigger timestamps: ms since midnight for each trigger type
+    // (0=ECG, 1=PPG, 2=Respiratory).  Always zero-initialise so scans without
+    // physio recording leave a well-defined default value.
+    using namespace ISMRMRD;  // bring enum values into scope
+    for (int i = 0; i < ISMRMRD_PHYS_STAMPS; ++i)
+        acq.physiology_time_stamp()[i] = (physio_stamps != nullptr) ? physio_stamps[i] : 0u;
+
+    // Trajectory cache metadata and pre-computed trajectory
+    if (cache.table.empty() ||
+        acquisition_index < 0 ||
+        acquisition_index >= static_cast<int>(cache.table.size()))
+        return;
+
+    const auto& entry = cache.table[acquisition_index];
+
+    auto& idx = acq.idx();
+    idx.kspace_encode_step_1 = static_cast<uint16_t>(entry.lin);
+    idx.kspace_encode_step_2 = static_cast<uint16_t>(entry.par);
+    idx.slice                = static_cast<uint16_t>(entry.slc);
+    idx.average              = static_cast<uint16_t>(entry.avg);
+    idx.contrast             = static_cast<uint16_t>(entry.eco);
+    idx.phase                = static_cast<uint16_t>(entry.phs);
+    idx.repetition           = static_cast<uint16_t>(entry.rep);
+    idx.set                  = static_cast<uint16_t>(entry.set);
+    idx.segment              = static_cast<uint16_t>(entry.seg);
+
+    const_cast<ISMRMRD::AcquisitionHeader&>(acq.getHead()).flags = entry.flags;
+    acq.center_sample()      = static_cast<uint16_t>(entry.center_sample);
+    acq.sample_time_us()     = entry.sample_time_us;
+    acq.encoding_space_ref() = static_cast<uint16_t>(entry.encoding_space_ref);
+
+    const int es = entry.encoding_space_ref;
+
+    // FIRST_IN / LAST_IN flags: compare each idx field against the actual
+    // per-encoding-space min/max from label_limits.  min is the real observed
+    // minimum (not zero-filled), so flags fire at the correct boundary values.
+    if (es >= 0 && es < static_cast<int>(cache.encoding_spaces.size())) {
+        const auto& ll = cache.encoding_spaces[es].label_limits;
+        // helper: OR in ISMRMRD first/last flag when idx field hits the limit
+#define SETFL(idxf, llf, fst, lst) do { \
+    if (static_cast<int>(idx.idxf) == ll.llf.min) acq.setFlag(fst); \
+    if (static_cast<int>(idx.idxf) == ll.llf.max) acq.setFlag(lst); \
+} while(0)
+        SETFL(kspace_encode_step_1, lin, ISMRMRD_ACQ_FIRST_IN_ENCODE_STEP1, ISMRMRD_ACQ_LAST_IN_ENCODE_STEP1);
+        SETFL(kspace_encode_step_2, par, ISMRMRD_ACQ_FIRST_IN_ENCODE_STEP2, ISMRMRD_ACQ_LAST_IN_ENCODE_STEP2);
+        SETFL(average,              acq, ISMRMRD_ACQ_FIRST_IN_AVERAGE,       ISMRMRD_ACQ_LAST_IN_AVERAGE);
+        SETFL(slice,                slc, ISMRMRD_ACQ_FIRST_IN_SLICE,         ISMRMRD_ACQ_LAST_IN_SLICE);
+        SETFL(contrast,             eco, ISMRMRD_ACQ_FIRST_IN_CONTRAST,      ISMRMRD_ACQ_LAST_IN_CONTRAST);
+        SETFL(phase,                phs, ISMRMRD_ACQ_FIRST_IN_PHASE,         ISMRMRD_ACQ_LAST_IN_PHASE);
+        SETFL(repetition,           rep, ISMRMRD_ACQ_FIRST_IN_REPETITION,    ISMRMRD_ACQ_LAST_IN_REPETITION);
+        SETFL(set,                  set, ISMRMRD_ACQ_FIRST_IN_SET,           ISMRMRD_ACQ_LAST_IN_SET);
+        SETFL(segment,              seg, ISMRMRD_ACQ_FIRST_IN_SEGMENT,       ISMRMRD_ACQ_LAST_IN_SEGMENT);
+#undef SETFL
+    }
+
+    if (es < 0 || es >= static_cast<int>(trajectories.size()))
+        return;
+
+    const auto& pt = trajectories[es];
+    const int ro_idx = (acquisition_index < static_cast<int>(readout_index_in_es.size()))
+                       ? readout_index_in_es[acquisition_index] : -1;
+    if (pt.ndim > 0 && ro_idx >= 0 && ro_idx < pt.num_readouts) {
+        acq.resize(acq.number_of_samples(), acq.active_channels(), pt.ndim);
+        const float* src = &pt.data[static_cast<size_t>(ro_idx) * pt.ndim * pt.num_samples];
+        std::memcpy(acq.getTrajPtr(), src, static_cast<size_t>(pt.ndim) * pt.num_samples * sizeof(float));
+    }
+}
+
+void add_waveform_information(ISMRMRD::IsmrmrdHeader& hdr,
+                              bool has_ecg, bool has_ppg, bool has_resp)
+{
+    struct Desc { bool enabled; ISMRMRD::WaveformType type; const char* name; };
+    const Desc descs[] = {
+        { has_ecg,  ISMRMRD::WaveformType::ECG,         "ECG"         },
+        { has_ppg,  ISMRMRD::WaveformType::PULSE,        "PPG"         },
+        { has_resp, ISMRMRD::WaveformType::RESPIRATORY,  "Respiratory" },
+    };
+    for (const auto& d : descs) {
+        if (!d.enabled) continue;
+        ISMRMRD::WaveformInformation info;
+        info.waveformName = d.name;
+        info.waveformType = d.type;
+        hdr.waveformInformation.push_back(info);
+    }
+}
+
+ISMRMRD::Waveform make_physio_waveform(uint16_t waveform_id,
+                                       uint32_t measurement_uid,
+                                       uint32_t scan_counter,
+                                       uint32_t time_stamp_ms,
+                                       float sample_time_us,
+                                       const std::vector<const int16_t*>& channels,
+                                       uint16_t num_samples)
+{
+    const uint16_t num_channels = static_cast<uint16_t>(channels.size());
+    ISMRMRD::Waveform wav(num_samples, num_channels);
+    wav.head.version          = ISMRMRD_VERSION_MAJOR;
+    wav.head.measurement_uid  = measurement_uid;
+    wav.head.scan_counter     = scan_counter;
+    wav.head.time_stamp       = time_stamp_ms;
+    wav.head.number_of_samples = num_samples;
+    wav.head.channels         = num_channels;
+    wav.head.sample_time_us   = sample_time_us;
+    wav.head.waveform_id      = waveform_id;
+
+    // Channel-major layout: all samples of ch0, then ch1, etc.
+    // int16_t sign-extended to uint32_t
+    uint32_t* dst = wav.begin_data();
+    for (uint16_t ch = 0; ch < num_channels; ++ch) {
+        const int16_t* src = channels[ch];
+        for (uint16_t s = 0; s < num_samples; ++s) {
+            dst[static_cast<size_t>(ch) * num_samples + s] =
+                static_cast<uint32_t>(static_cast<int32_t>(src[s]));
+        }
+    }
+    return wav;
 }
 
 } // namespace mrdserver

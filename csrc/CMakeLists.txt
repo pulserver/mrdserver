@@ -16,12 +16,9 @@ add_library(GadgetronClient STATIC ${SOURCE_FILES})
 target_compile_features(GadgetronClient PUBLIC cxx_std_17)
 target_compile_options(GadgetronClient PRIVATE -mavx2 -mfma)
 
-find_package(Boost REQUIRED COMPONENTS headers program_options)
-find_package(ISMRMRD REQUIRED)
-
 target_link_libraries(GadgetronClient PRIVATE Boost::headers)
 target_link_libraries(GadgetronClient PRIVATE Boost::program_options)
-target_link_libraries(GadgetronClient PRIVATE ISMRMRD::ISMRMRD)
+target_link_libraries(GadgetronClient PRIVATE ismrmrd)
 
 target_include_directories(GadgetronClient PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
