@@ -11,12 +11,14 @@ import socket
 import sys
 import threading
 from types import ModuleType
+from typing import Any
 
 import ismrmrd
 import ismrmrd.xsd
 
 from . import constants
-from .connection import Connection
+from .concurrency import compute_max_concurrent
+from .connection import Connection, DataSaver, DummySaver, build_save_path
 from .rtp_connection import RtpServer
 
 
@@ -53,6 +55,8 @@ class Server:
         handler_dirs: list[str] | None = None,
         rtp_port: int | None = None,
         rtp_handler: str = "pmcrecon",
+        max_concurrent_recons: int | None = None,
+        per_recon_gb: float = 48.0,
     ) -> None:
         self.host = host
         self.port = port
@@ -64,15 +68,23 @@ class Server:
         self.rtp_handler = rtp_handler
         self._rtp_server: RtpServer | None = None
 
+        # Concurrency limit — auto-detected from available RAM or overridden
+        self._max_slots = compute_max_concurrent(
+            per_recon_gb=per_recon_gb,
+            override=max_concurrent_recons,
+        )
+        self._slots = threading.BoundedSemaphore(self._max_slots)
+
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._socket.bind((self.host, self.port))
 
         logging.info(
-            "MRD server listening on %s:%d  (default handler: %s)",
+            "MRD server listening on %s:%d  (default handler: %s, max recon slots: %d)",
             self.host,
             self.port,
             self.default_handler,
+            self._max_slots,
         )
 
     # ------------------------------------------------------------------
@@ -113,6 +125,11 @@ class Server:
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
+        # Start the offline-replay worker (daemon thread — exits when server exits)
+        from .replay import ReplayWorker
+        self._replay_worker = ReplayWorker(self)
+        self._replay_worker.start()
+
         while True:
             try:
                 sock, (remote_addr, remote_port) = self._socket.accept()
@@ -134,22 +151,26 @@ class Server:
     # ------------------------------------------------------------------
 
     def _handle_connection(self, sock: socket.socket) -> None:
+        # Create connection with savedata=False; the saver is configured explicitly
+        # after metadata is available so that the bucket-based save path can be built.
         connection = Connection(
             sock,
-            savedata=self.save_data,
-            savedataFolder=self.output_dir,
+            savedata=False,
             savedataGroup="dataset",
         )
 
+        config: str = "<unknown>"
+        acquired = False
+
         try:
-            # 1) Config message
-            config = next(connection)
+            # 1) Config message (handler module name)
+            _, config = next(connection)
             if config is None and connection.is_exhausted:
                 logging.info("Connection closed without data")
                 return
 
             # 2) XML header
-            metadata_xml = next(connection)
+            _, metadata_xml = next(connection)
             if metadata_xml is None and connection.is_exhausted:
                 logging.info("Connection closed without MRD header")
                 return
@@ -168,17 +189,47 @@ class Server:
                 logging.warning("Metadata is not valid MRD XML — passing as text")
                 metadata = metadata_xml
 
-            # 3) Resolve handler module
+            # 3) Try to acquire a recon slot (non-blocking)
+            acquired = self._slots.acquire(blocking=False)
+            if not acquired:
+                logging.warning(
+                    "All %d recon slot(s) busy — queuing connection to disk  handler=%s",
+                    self._max_slots,
+                    config,
+                )
+                self._drain_and_queue(connection, config, metadata, metadata_xml)
+                return
+
+            # 4) Configure data saver with the correct bucket-based path
+            if self.save_data:
+                save_path = build_save_path(metadata, self.output_dir)
+                connection.saver = DataSaver(
+                    savedataFile=os.path.basename(save_path),
+                    savedataFolder=os.path.dirname(save_path),
+                    savedataGroup="dataset",
+                )
+                connection.saver.create_save_file()
+                if isinstance(metadata_xml, str):
+                    connection.saver.dset.write_xml_header(metadata_xml)
+
+            # 5) Resolve and run handler
             module = self._resolve_handler(config)
-            logging.info("Starting handler '%s'", module.__name__)
+            logging.info(
+                "Starting handler '%s'  [slot %d/%d]",
+                module.__name__,
+                self._max_slots - self._slots._value,  # approximate occupancy
+                self._max_slots,
+            )
             module.process(connection, config, metadata)
 
         except Exception:
-            logging.exception("Error handling connection")
+            logging.exception("Error handling connection  handler=%s", config)
 
         finally:
+            if acquired:
+                self._slots.release()
+                logging.info("Recon slot released  handler=%s", config)
             connection.shutdown_close()
-            # Close HDF5 dataset if still open
             if hasattr(connection.saver, "dset") and connection.saver.dset is not None:
                 try:
                     connection.saver.dset.close()
@@ -188,6 +239,71 @@ class Server:
                 logging.info(
                     "Incoming data saved at %s", connection.saver.mrdFilePath
                 )
+
+    # ------------------------------------------------------------------
+    # Overflow: drain to disk and queue for later replay
+    # ------------------------------------------------------------------
+
+    def _drain_and_queue(
+        self,
+        connection: Connection,
+        config: str,
+        metadata: Any,
+        metadata_xml: str,
+    ) -> None:
+        """Drain *connection* to an HDF5 file and write a ``.queued.json`` sidecar.
+
+        Called when all recon slots are busy.  The incoming stream is still
+        fully consumed so the client (VRE) sees a clean connection lifecycle.
+        A :class:`~mrdserver.replay.ReplayWorker` will pick up the sidecar
+        and replay the session through *config* when a slot becomes available.
+        """
+        from .replay import enqueue
+
+        save_path = build_save_path(metadata, self.output_dir)
+
+        # Extract bucket_pid for the sidecar (informational)
+        bucket_pid: str | None = None
+        try:
+            if hasattr(metadata, "userParameters") and metadata.userParameters is not None:
+                for p in metadata.userParameters.userParameterString:
+                    if p.name == "bucket_pid":
+                        bucket_pid = p.value
+                        break
+        except Exception:
+            pass
+
+        saver = DataSaver(
+            savedataFile=os.path.basename(save_path),
+            savedataFolder=os.path.dirname(save_path),
+            savedataGroup="dataset",
+        )
+        try:
+            saver.create_save_file()
+            # Write the XML header that was already read from the stream
+            if isinstance(metadata_xml, str) and saver.dset is not None:
+                try:
+                    saver.dset.write_xml_header(metadata_xml)
+                except Exception as exc:
+                    logging.warning("Could not write XML header to queued file: %s", exc)
+            # Drain all remaining acquisitions / waveforms from the stream
+            for mid, item in connection.iter_with_mids():
+                saver.save(mid, item)
+        finally:
+            if saver.dset is not None:
+                try:
+                    saver.dset.close()
+                except Exception:
+                    pass
+
+        sidecar_path = enqueue(save_path, config, bucket_pid)
+        logging.info(
+            "Queued to disk  mrd=%s  handler=%s  bucket_pid=%s  sidecar=%s",
+            save_path,
+            config,
+            bucket_pid,
+            sidecar_path,
+        )
 
     # ------------------------------------------------------------------
     # Handler resolution

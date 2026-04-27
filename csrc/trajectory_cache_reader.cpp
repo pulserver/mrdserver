@@ -16,6 +16,8 @@
 #include <stdexcept>
 #include <cstring>
 #include <ctime>
+#include <cstdlib>
+#include <sstream>
 #include <algorithm>
 
 #include "ismrmrd/ismrmrd.h"
@@ -620,6 +622,67 @@ std::vector<PrecomputedTrajectory> pre_compute_trajectories(const SequenceCache&
     }
 
     return result;
+}
+
+namespace {
+
+/* Map cfgradcoil identifier to the GE coef base name.
+ * Reference values from EPIC pulserver.allcv.h:
+ *   1=CRD, 2=Roemer, 101=HGC, 102=Vectra, 103=Permanent.
+ * Add new entries as more gradient subsystems become relevant. */
+const char* cfgradcoil_to_coef_name(int id)
+{
+    switch (id) {
+        case 1:   return "crd";
+        case 2:   return "roemer";
+        case 101: return "hgc";
+        case 102: return "vectra";
+        case 103: return "permanent";
+        default:  return nullptr;
+    }
+}
+
+std::string sequence_resource_base_dir()
+{
+    const char* env = std::getenv("GADGETRON_RESOURCE_DIR");
+    if (env && env[0] != '\0') return std::string(env);
+    return std::string("/usr/g/bin");
+}
+
+} // anonymous namespace
+
+void set_user_parameter_string(ISMRMRD::IsmrmrdHeader& hdr,
+                               const std::string& name,
+                               const std::string& value)
+{
+    if (!hdr.userParameters) hdr.userParameters = ISMRMRD::UserParameters();
+    auto& strs = hdr.userParameters->userParameterString;
+    for (auto& p : strs) {
+        if (p.name == name) { p.value = value; return; }
+    }
+    ISMRMRD::UserParameterString p;
+    p.name  = name;
+    p.value = value;
+    strs.push_back(p);
+}
+
+void add_sequence_resource_paths(ISMRMRD::IsmrmrdHeader& hdr,
+                                 int tensor_index,
+                                 int grad_coil_id)
+{
+    const std::string base = sequence_resource_base_dir();
+
+    if (tensor_index > 0) {
+        std::ostringstream oss;
+        oss << base << "/tensor" << tensor_index << ".dat";
+        set_user_parameter_string(hdr, "tensor_dat_path", oss.str());
+    }
+
+    if (const char* coef = cfgradcoil_to_coef_name(grad_coil_id)) {
+        std::ostringstream oss;
+        oss << base << "/" << coef << ".coef";
+        set_user_parameter_string(hdr, "grad_coef_path", oss.str());
+    }
 }
 
 void enrich_ismrmrd_header(ISMRMRD::IsmrmrdHeader& hdr, const SequenceCache& cache)

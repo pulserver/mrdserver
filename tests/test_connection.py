@@ -74,7 +74,7 @@ def test_data_saver_autogen_filename(tmp_path):
     folder = str(tmp_path)
     saver = DataSaver(savedataFile="", savedataFolder=folder, savedataGroup="dataset")
     saver.create_save_file()
-    assert saver.savedataFile.startswith("MRD_input_")
+    assert saver.savedataFile.startswith("mrd_unknown_")
     assert saver.savedataFile.endswith(".h5")
     saver.dset.close()
 
@@ -316,7 +316,7 @@ def test_connection_with_savedata(tmp_path):
         list(conn)  # drain
 
         # Verify HDF5 file was created
-        h5_files = list(tmp_path.glob("MRD_input_*.h5"))
+        h5_files = list(tmp_path.glob("mrd_unknown_*.h5"))
         assert len(h5_files) == 1
     finally:
         peer.close()

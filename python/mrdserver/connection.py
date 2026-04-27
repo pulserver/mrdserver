@@ -5,11 +5,11 @@ This module provides the Connection class for managing connections to ISMRMRD cl
 including reading and writing various message types with logging and filtering capabilities.
 """
 
-__all__ = ["Connection"]  # Removed ClientConnection and ServerConnection
+__all__ = ["Connection", "DataSaver", "DummySaver", "build_save_path"]
 
 import logging
 import os
-import random
+import re
 import socket
 import threading
 
@@ -93,15 +93,77 @@ MID_TO_TYPE = {mt.mid: mt for mt in MessageType}
 NAME_TO_TYPE = {mt.name: mt for mt in MessageType}
 
 
+# ---------------------------------------------------------------------------
+# Save-path helper
+# ---------------------------------------------------------------------------
+
+_BUCKET_BASE = "/export/home/sdc/pulserver/bucket"
+
+
+def build_save_path(metadata: Any, fallback_dir: str) -> str:
+    """Return the full path for saving one scan's ISMRMRD data.
+
+    Reads ``bucket_pid`` and ``stationName`` from the parsed ISMRMRD header
+    when available, and constructs::
+
+        /export/home/sdc/pulserver/bucket/<pid>/mrd_<scanner>_<YYYYMMDDTHHMMSS>.h5
+
+    Falls back to ``fallback_dir/mrd_unknown_<ts>.h5`` when header fields are
+    absent (e.g. in development / test environments).
+
+    The directory is created with ``exist_ok=True`` before returning.
+    """
+    bucket_pid: str | None = None
+    scanner_id = "unknown"
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+
+    try:
+        if hasattr(metadata, "userParameters") and metadata.userParameters is not None:
+            for p in metadata.userParameters.userParameterString:
+                if p.name == "bucket_pid":
+                    bucket_pid = p.value
+                    break
+    except Exception:
+        pass
+
+    try:
+        if (
+            hasattr(metadata, "acquisitionSystemInformation")
+            and metadata.acquisitionSystemInformation is not None
+        ):
+            station = metadata.acquisitionSystemInformation.stationName
+            if station:
+                # Keep only alphanumeric + underscore; strip leading/trailing underscores
+                scanner_id = re.sub(r"[^a-zA-Z0-9_]", "_", station).strip("_") or "unknown"
+    except Exception:
+        pass
+
+    filename = f"mrd_{scanner_id}_{ts}.h5"
+
+    if bucket_pid is not None:
+        folder = os.path.join(_BUCKET_BASE, str(bucket_pid))
+    else:
+        folder = fallback_dir or "/tmp/mrdserver"
+
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, filename)
+
+
+# ---------------------------------------------------------------------------
+# DataSaver
+# ---------------------------------------------------------------------------
+
+
 class DataSaver:
     """Persist incoming ISMRMRD data to an HDF5 file.
 
     Parameters
     ----------
     savedataFile : str
-        Filename for the HDF5 file (auto-generated if empty).
+        Filename for the HDF5 file (auto-generated via :func:`build_save_path`
+        if empty).
     savedataFolder : str
-        Directory for saved files.
+        Directory for saved files (used only when ``savedataFile`` is empty).
     savedataGroup : str
         HDF5 group name inside the file.
     """
@@ -114,18 +176,12 @@ class DataSaver:
         self.dset: ismrmrd.Dataset | None = None
 
     def create_save_file(self) -> None:
-        # Create Folder if needed
-        if not os.path.exists(self.savedataFolder):
-            os.makedirs(self.savedataFolder)
-            logging.debug(
-                "Created folder " + self.savedataFolder + " to save incoming data"
-            )
+        # Ensure save directory exists
+        os.makedirs(self.savedataFolder, exist_ok=True)
 
-        # Generate filename if not provided
+        # Generate a fallback filename if none was supplied
         if not self.savedataFile:
-            self.savedataFile = "MRD_input_" + datetime.now().strftime(
-                "%Y-%m-%d-%H%M%S" + "_" + str(random.randint(0, 100)) + ".h5"
-            )
+            self.savedataFile = "mrd_unknown_" + datetime.now().strftime("%Y%m%dT%H%M%S") + ".h5"
 
         # Full path to the file
         self.mrdFilePath = os.path.join(self.savedataFolder, self.savedataFile)

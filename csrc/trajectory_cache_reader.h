@@ -221,6 +221,40 @@ std::vector<PrecomputedTrajectory> pre_compute_trajectories(const SequenceCache&
 void enrich_ismrmrd_header(ISMRMRD::IsmrmrdHeader& hdr, const SequenceCache& cache);
 
 /**
+ * @brief Add or update a UserParameterString entry in the ISMRMRD header.
+ *
+ * Creates hdr.userParameters if absent. If a UserParameterString with the
+ * same `name` already exists, its `value` is overwritten; otherwise a new
+ * entry is appended.
+ *
+ * @param hdr    Header to modify in-place.
+ * @param name   Parameter name (e.g. "tensor_dat_path", "grad_coef_path").
+ * @param value  Parameter string value.
+ */
+void set_user_parameter_string(ISMRMRD::IsmrmrdHeader& hdr,
+                               const std::string& name,
+                               const std::string& value);
+
+/**
+ * @brief Resolve and inject sequence-description path UserParameters.
+ *
+ * Adds:
+ *  - "tensor_dat_path" = "<base>/tensor<tensor_index>.dat"  if tensor_index > 0
+ *  - "grad_coef_path"  = "<base>/<grad_coil_name>.coef"     if mapping known
+ *
+ * Files are NOT opened or validated; the recon side handles I/O. The base
+ * directory defaults to "/usr/g/bin" (the GE scanner research dir) and may
+ * be overridden via the GADGETRON_RESOURCE_DIR environment variable.
+ *
+ * @param hdr            Header to modify in-place.
+ * @param tensor_index   Diffusion tensor file index (rdb_hdr_user6); 0 = skip.
+ * @param grad_coil_id   cfgradcoil value (rdb_hdr_user7); unknown ids are skipped.
+ */
+void add_sequence_resource_paths(ISMRMRD::IsmrmrdHeader& hdr,
+                                 int tensor_index,
+                                 int grad_coil_id);
+
+/**
  * @brief Enrich an ISMRMRD Acquisition with trajectory cache metadata,
  *        pre-computed trajectory data, and scan-invariant header fields.
  *

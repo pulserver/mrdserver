@@ -17,6 +17,9 @@ _DEFAULTS = {
         os.path.join(os.environ.get("PULSERVER_BASE", "/tmp"), "mrdserver"),
     ),
     "log_level": "INFO",
+    # Concurrency: 0 means auto-detect from available RAM
+    "max_recon": int(os.environ.get("MRDSERVER_MAX_RECON", "0")) or None,
+    "per_recon_gb": float(os.environ.get("MRDSERVER_PER_RECON_GB", "48.0")),
 }
 
 
@@ -85,6 +88,28 @@ def main(argv: list[str] | None = None) -> None:
         default="pmcrecon",
         help="Handler module name for the RTP PMC connection",
     )
+    parser.add_argument(
+        "--max-recon",
+        type=int,
+        dest="max_recon",
+        metavar="N",
+        help=(
+            "Maximum simultaneous reconstruction sessions.  "
+            "0 or omitted = auto-detect from available RAM.  "
+            "Override with env var MRDSERVER_MAX_RECON."
+        ),
+    )
+    parser.add_argument(
+        "--per-recon-gb",
+        type=float,
+        dest="per_recon_gb",
+        metavar="GB",
+        help=(
+            "Estimated RAM (GiB) consumed by one reconstruction session "
+            "(used for auto-detection, default 48).  "
+            "Override with env var MRDSERVER_PER_RECON_GB."
+        ),
+    )
 
     parser.set_defaults(**_DEFAULTS)
     args = parser.parse_args(argv)
@@ -116,6 +141,8 @@ def main(argv: list[str] | None = None) -> None:
         handler_dirs=args.handler_dir,
         rtp_port=args.rtp_port,
         rtp_handler=args.rtp_handler,
+        max_concurrent_recons=args.max_recon,
+        per_recon_gb=args.per_recon_gb,
     )
     server.start_rtp_server()
     server.serve()

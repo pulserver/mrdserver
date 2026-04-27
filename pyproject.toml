@@ -14,6 +14,7 @@ dependencies = [
     "ismrmrd>=1.14.1",
     "pydicom",
     "h5py",
+    "psutil",
 ]
 
 [project.optional-dependencies]

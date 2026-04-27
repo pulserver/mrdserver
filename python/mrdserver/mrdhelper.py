@@ -87,6 +87,33 @@ def get_userParameterBase64_value(metadata, name):
     return None
 
 
+def get_sequence_resource_paths(metadata):
+    """Return the pulserver sequence-resource paths from the MRD XMLHeader.
+
+    These are written by the VRE OnPrep stage of the pulserver-interpreter
+    (see ``mrdserver/csrc/trajectory_cache_reader.cpp::add_sequence_resource_paths``)
+    based on the rhuser6/7 raw-header slots set by the PSD:
+
+    * ``tensor_dat_path``: absolute path to a diffusion tensor file
+      (e.g. ``/usr/g/bin/tensor7.dat``). Present only when the PSD's
+      ``opuser3`` is non-zero.
+    * ``grad_coef_path``: absolute path to a gradient coefficient file
+      matching the scanner's gradient subsystem (``cfgradcoil``).
+
+    Either entry may be missing; the caller is responsible for handling
+    ``None`` values.
+
+    Returns
+    -------
+    dict with keys ``"tensor_dat_path"`` and ``"grad_coef_path"``. Values
+    are ``str`` if the entry is present, otherwise ``None``.
+    """
+    return {
+        "tensor_dat_path": get_userParameterString_value(metadata, "tensor_dat_path"),
+        "grad_coef_path":  get_userParameterString_value(metadata, "grad_coef_path"),
+    }
+
+
 def get_meta_value(meta, key):
     """Get a value from MRD Meta Attributes (returns None if key not found)"""
     if key in meta.keys():
