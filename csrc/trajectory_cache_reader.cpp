@@ -2,9 +2,10 @@
  * @file trajectory_cache_reader.cpp
  * @brief Standalone reader for pulseqlib binary cache.
  *
- * Reads two sections from the cache:
+ * Reads sections from the cache:
  *   - Section 2 (GENINSTRUCTIONS): rotation matrices
  *   - Section 5 (TRAJECTORY): kshot library, encoding spaces, table
+ *   - Section 6 (SEQUENCEDESCRIPTION): event lists, RF shapes, shims (optional)
  *
  * No dependency on pulserverlib. All integer and float fields are 4 bytes.
  */
@@ -28,6 +29,7 @@ namespace {
 constexpr int32_t CACHE_ENDIAN_MARKER          = 0x01020304;
 constexpr int     SECTION_GENINSTRUCTIONS      = 2;
 constexpr int     SECTION_TRAJECTORY           = 5;
+constexpr int     SECTION_SEQUENCEDESCRIPTION  = 6;
 constexpr int     MAX_GRAD_SHOTS               = 16;
 
 // ---------- byte-swap helpers ----------
@@ -73,7 +75,7 @@ void skip_ints(std::ifstream& f, int count) {
 
 std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
     std::ifstream& f, long section_offset, int section_size, bool do_swap,
-    TrajectoryCache& cache)
+    SequenceCache& cache)
 {
     std::vector<std::array<float, 9>> rotations;
 
@@ -253,9 +255,9 @@ std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
 
 // ---------- Public API ----------
 
-TrajectoryCache read_trajectory_cache(const std::string& cache_path)
+SequenceCache read_sequence_cache(const std::string& cache_path)
 {
-    TrajectoryCache cache;
+    SequenceCache cache;
 
     std::ifstream f(cache_path, std::ios::binary);
     if (!f.is_open()) return cache;  // empty if file not found
@@ -292,12 +294,14 @@ TrajectoryCache read_trajectory_cache(const std::string& cache_path)
         sections[i].size   = read_int(f, do_swap);
     }
 
-    // Find sections 2 (GENINSTRUCTIONS) and 5 (TRAJECTORY)
+    // Find sections 2 (GENINSTRUCTIONS), 5 (TRAJECTORY), and 6 (SEQUENCEDESCRIPTION)
     const SectionEntry* geninst_section = nullptr;
     const SectionEntry* traj_section    = nullptr;
+    const SectionEntry* seqdesc_section = nullptr;
     for (auto& s : sections) {
-        if (s.id == SECTION_GENINSTRUCTIONS) geninst_section = &s;
-        if (s.id == SECTION_TRAJECTORY)      traj_section    = &s;
+        if (s.id == SECTION_GENINSTRUCTIONS)     geninst_section = &s;
+        if (s.id == SECTION_TRAJECTORY)          traj_section    = &s;
+        if (s.id == SECTION_SEQUENCEDESCRIPTION) seqdesc_section = &s;
     }
 
     if (!traj_section) return cache;  // no trajectory data
@@ -395,10 +399,116 @@ TrajectoryCache read_trajectory_cache(const std::string& cache_path)
         e.encoding_space_ref = read_int(f, do_swap);
     }
 
+    // Read Section 6 — sequence description (optional; graceful skip if absent)
+    if (seqdesc_section) {
+        f.seekg(seqdesc_section->offset, std::ios::beg);
+        if (f.good()) {
+            try {
+                // Sequence parameters
+                auto& sp = cache.seq_params;
+                sp.min_te_us           = read_float(f, do_swap);
+                sp.min_tr_us           = read_float(f, do_swap);
+                sp.max_tr_us           = read_float(f, do_swap);
+                sp.max_flip_angle_deg  = read_float(f, do_swap);
+                sp.total_scan_time_us  = read_float(f, do_swap);
+                sp.num_subseqs         = read_int(f, do_swap);
+                read_int(f, do_swap); read_int(f, do_swap); read_int(f, do_swap); // reserved
+
+                cache.seq_descs.resize(static_cast<size_t>(sp.num_subseqs));
+
+                for (int ss = 0; ss < sp.num_subseqs; ++ss) {
+                    auto& sd = cache.seq_descs[static_cast<size_t>(ss)];
+                    sd.subseq_idx     = read_int(f, do_swap);
+                    sd.tr_duration_us = read_float(f, do_swap);
+
+                    // RF shape tuples
+                    int num_tuples = read_int(f, do_swap);
+                    sd.rf_shape_tuples.resize(static_cast<size_t>(num_tuples));
+                    for (int t = 0; t < num_tuples; ++t) {
+                        auto& tup = sd.rf_shape_tuples[static_cast<size_t>(t)];
+                        tup.tuple_id     = read_int(f, do_swap);
+                        tup.N_tx         = read_int(f, do_swap);
+                        tup.N_samples    = read_int(f, do_swap);
+                        tup.rf_raster_us = read_float(f, do_swap);
+                        tup.num_bands    = read_int(f, do_swap);
+                        for (int b = 0; b < SEQDESC_MAX_BANDS; ++b)
+                            tup.band_freq_offsets_hz[b] = read_float(f, do_swap);
+                        tup.band_bandwidth_hz = read_float(f, do_swap);
+                        tup.total_b1sq_power  = read_float(f, do_swap);
+                        int tot = tup.N_tx * tup.N_samples;
+                        if (tot > 0) {
+                            tup.mag.resize(static_cast<size_t>(tot));
+                            if (!read4(f, tup.mag.data(), tot))
+                                throw std::runtime_error("EOF reading RF mag");
+                            if (do_swap) swap4_array(tup.mag.data(), tot);
+                        }
+                        int has_phase = read_int(f, do_swap);
+                        if (has_phase && tot > 0) {
+                            tup.phase.resize(static_cast<size_t>(tot));
+                            if (!read4(f, tup.phase.data(), tot))
+                                throw std::runtime_error("EOF reading RF phase");
+                            if (do_swap) swap4_array(tup.phase.data(), tot);
+                        }
+                        int has_time = read_int(f, do_swap);
+                        if (has_time && tup.N_samples > 0) {
+                            tup.time.resize(static_cast<size_t>(tup.N_samples));
+                            if (!read4(f, tup.time.data(), tup.N_samples))
+                                throw std::runtime_error("EOF reading RF time");
+                            if (do_swap) swap4_array(tup.time.data(), tup.N_samples);
+                        }
+                    }
+
+                    // Shim definitions
+                    int num_shims = read_int(f, do_swap);
+                    sd.shim_defs.resize(static_cast<size_t>(num_shims));
+                    for (int s2 = 0; s2 < num_shims; ++s2) {
+                        auto& sh = sd.shim_defs[static_cast<size_t>(s2)];
+                        sh.shim_id_local = read_int(f, do_swap);
+                        sh.N_ch          = read_int(f, do_swap);
+                        sh.magnitudes.resize(static_cast<size_t>(sh.N_ch));
+                        for (int c = 0; c < sh.N_ch; ++c)
+                            sh.magnitudes[static_cast<size_t>(c)] = read_float(f, do_swap);
+                        sh.phases.resize(static_cast<size_t>(sh.N_ch));
+                        for (int c = 0; c < sh.N_ch; ++c)
+                            sh.phases[static_cast<size_t>(c)] = read_float(f, do_swap);
+                    }
+
+                    // Events
+                    int num_events = read_int(f, do_swap);
+                    sd.events.resize(static_cast<size_t>(num_events));
+                    for (int e2 = 0; e2 < num_events; ++e2) {
+                        auto& ev = sd.events[static_cast<size_t>(e2)];
+                        ev.type = static_cast<SeqEventType>(read_int(f, do_swap));
+                        for (int p = 0; p < 7; ++p)
+                            ev.params[p] = read_float(f, do_swap);
+                    }
+
+                    // Composite RF groups
+                    int num_groups = read_int(f, do_swap);
+                    sd.composite_rf_groups.resize(static_cast<size_t>(num_groups));
+                    for (int g = 0; g < num_groups; ++g) {
+                        auto& cg = sd.composite_rf_groups[static_cast<size_t>(g)];
+                        cg.group_id        = read_int(f, do_swap);
+                        cg.first_event_idx = read_int(f, do_swap);
+                        cg.last_event_idx  = read_int(f, do_swap);
+                        cg.num_pulses      = read_int(f, do_swap);
+                        cg.eff_te_us       = read_float(f, do_swap);
+                    }
+                }
+
+                cache.has_seq_desc = true;
+            } catch (...) {
+                // Sequence description is optional — degrade gracefully
+                cache.seq_descs.clear();
+                cache.has_seq_desc = false;
+            }
+        }
+    }
+
     return cache;
 }
 
-std::vector<PrecomputedTrajectory> pre_compute_trajectories(const TrajectoryCache& cache)
+std::vector<PrecomputedTrajectory> pre_compute_trajectories(const SequenceCache& cache)
 {
     const int num_es = static_cast<int>(cache.encoding_spaces.size());
     std::vector<PrecomputedTrajectory> result(static_cast<size_t>(num_es));
@@ -512,7 +622,7 @@ std::vector<PrecomputedTrajectory> pre_compute_trajectories(const TrajectoryCach
     return result;
 }
 
-void enrich_ismrmrd_header(ISMRMRD::IsmrmrdHeader& hdr, const TrajectoryCache& cache)
+void enrich_ismrmrd_header(ISMRMRD::IsmrmrdHeader& hdr, const SequenceCache& cache)
 {
     // --- Sequence parameters from definitions ---
     {
@@ -591,7 +701,7 @@ void enrich_ismrmrd_acquisition(
     int acquisition_index,
     uint32_t measurement_uid,
     float table_position_z,
-    const TrajectoryCache& cache,
+    const SequenceCache& cache,
     const std::vector<PrecomputedTrajectory>& trajectories,
     const std::vector<int>& readout_index_in_es,
     const uint32_t* physio_stamps)
@@ -725,6 +835,135 @@ ISMRMRD::Waveform make_physio_waveform(uint16_t waveform_id,
         }
     }
     return wav;
+}
+
+// ---------- Helper: build a float-payload waveform ----------
+// All values are stored as bit-casts of float32 into uint32 channels.
+// num_channels = 1 (all data serialised as a flat uint32 stream).
+static ISMRMRD::Waveform make_float_payload_waveform(
+    uint16_t         waveform_id,
+    uint32_t         measurement_uid,
+    uint32_t         scan_counter,
+    const std::vector<uint32_t>& payload)
+{
+    const auto n = static_cast<uint16_t>(
+        payload.size() > 65535u ? 65535u : payload.size());
+    ISMRMRD::Waveform wav(n, 1);
+    wav.head.version           = ISMRMRD_VERSION_MAJOR;
+    wav.head.measurement_uid   = measurement_uid;
+    wav.head.scan_counter      = scan_counter;
+    wav.head.time_stamp        = 0;
+    wav.head.number_of_samples = n;
+    wav.head.channels          = 1;
+    wav.head.sample_time_us    = 1.0f;
+    wav.head.waveform_id       = waveform_id;
+    std::memcpy(wav.begin_data(), payload.data(), n * sizeof(uint32_t));
+    return wav;
+}
+
+static uint32_t f2u(float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, sizeof(u));
+    return u;
+}
+
+// ================================================================
+// Sequence-description waveform factory functions
+// ================================================================
+
+ISMRMRD::Waveform make_seqdesc_header_waveform(
+    const SequenceCache& cache,
+    uint32_t measurement_uid,
+    uint32_t scan_counter)
+{
+    const auto& sp = cache.seq_params;
+    std::vector<uint32_t> p;
+    p.reserve(8);
+    p.push_back(static_cast<uint32_t>(sp.num_subseqs));
+    p.push_back(f2u(sp.min_te_us));
+    p.push_back(f2u(sp.min_tr_us));
+    p.push_back(f2u(sp.max_tr_us));
+    p.push_back(f2u(sp.max_flip_angle_deg));
+    p.push_back(f2u(sp.total_scan_time_us));
+    return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_HEADER,
+                                       measurement_uid, scan_counter, p);
+}
+
+ISMRMRD::Waveform make_seqdesc_events_waveform(
+    const SequenceDescription& desc,
+    uint32_t measurement_uid,
+    uint32_t scan_counter)
+{
+    // Header: subseq_idx, tr_duration_us, num_events
+    // Per event: type (int), params[7] (float x7)
+    std::vector<uint32_t> p;
+    p.reserve(3 + desc.events.size() * 8);
+    p.push_back(static_cast<uint32_t>(desc.subseq_idx));
+    p.push_back(f2u(desc.tr_duration_us));
+    p.push_back(static_cast<uint32_t>(desc.events.size()));
+    for (const auto& ev : desc.events) {
+        p.push_back(static_cast<uint32_t>(ev.type));
+        for (int i = 0; i < 7; ++i)
+            p.push_back(f2u(ev.params[i]));
+    }
+    return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_EVENTS,
+                                       measurement_uid, scan_counter, p);
+}
+
+ISMRMRD::Waveform make_seqdesc_rf_shapes_waveform(
+    const SequenceDescription& desc,
+    uint32_t measurement_uid,
+    uint32_t scan_counter)
+{
+    // Header: subseq_idx, num_tuples
+    // Per tuple: tuple_id, N_tx, N_samples, rf_raster_us, num_bands,
+    //            band_freq_offsets_hz[8], band_bandwidth_hz, total_b1sq_power,
+    //            has_phase, has_time,
+    //            mag[N_tx*N_samples], [phase[N_tx*N_samples]], [time[N_samples]]
+    std::vector<uint32_t> p;
+    p.push_back(static_cast<uint32_t>(desc.subseq_idx));
+    p.push_back(static_cast<uint32_t>(desc.rf_shape_tuples.size()));
+    for (const auto& t : desc.rf_shape_tuples) {
+        p.push_back(static_cast<uint32_t>(t.tuple_id));
+        p.push_back(static_cast<uint32_t>(t.N_tx));
+        p.push_back(static_cast<uint32_t>(t.N_samples));
+        p.push_back(f2u(t.rf_raster_us));
+        p.push_back(static_cast<uint32_t>(t.num_bands));
+        for (int b = 0; b < SEQDESC_MAX_BANDS; ++b)
+            p.push_back(f2u(t.band_freq_offsets_hz[b]));
+        p.push_back(f2u(t.band_bandwidth_hz));
+        p.push_back(f2u(t.total_b1sq_power));
+        // Magnitude
+        for (float v : t.mag)   p.push_back(f2u(v));
+        // Phase
+        p.push_back(t.phase.empty() ? 0u : 1u);
+        if (!t.phase.empty())
+            for (float v : t.phase) p.push_back(f2u(v));
+        // Time
+        p.push_back(t.time.empty() ? 0u : 1u);
+        if (!t.time.empty())
+            for (float v : t.time) p.push_back(f2u(v));
+    }
+    return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_RF_SHAPES,
+                                       measurement_uid, scan_counter, p);
+}
+
+ISMRMRD::Waveform make_seqdesc_shims_waveform(
+    const SequenceDescription& desc,
+    uint32_t measurement_uid,
+    uint32_t scan_counter)
+{
+    std::vector<uint32_t> p;
+    p.push_back(static_cast<uint32_t>(desc.subseq_idx));
+    p.push_back(static_cast<uint32_t>(desc.shim_defs.size()));
+    for (const auto& s : desc.shim_defs) {
+        p.push_back(static_cast<uint32_t>(s.shim_id_local));
+        p.push_back(static_cast<uint32_t>(s.N_ch));
+        for (float v : s.magnitudes) p.push_back(f2u(v));
+        for (float v : s.phases)     p.push_back(f2u(v));
+    }
+    return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_SHIMS,
+                                       measurement_uid, scan_counter, p);
 }
 
 } // namespace mrdserver
