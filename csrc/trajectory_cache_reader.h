@@ -50,10 +50,11 @@ struct TrajTableEntry {
     int   center_sample;       /**< k-zero sample index                */
     float sample_time_us;      /**< ADC dwell time (us)                */
     int   encoding_space_ref;  /**< encoding space index                */
+    int32_t off = 0;           /**< Pulseq LABELSET OFF flag (1=discard) */
 };
 
 /* ------------------------------------------------------------------ */
-/*  Sequence-description structs (Section 6)                          */
+/*  Sequence-description structs (Section 5)                          */
 /* ------------------------------------------------------------------ */
 
 static constexpr int SEQDESC_MAX_BANDS = 8;

@@ -30,8 +30,8 @@ namespace {
 
 constexpr int32_t CACHE_ENDIAN_MARKER          = 0x01020304;
 constexpr int     SECTION_GENINSTRUCTIONS      = 2;
-constexpr int     SECTION_TRAJECTORY           = 5;
-constexpr int     SECTION_SEQUENCEDESCRIPTION  = 6;
+constexpr int     SECTION_TRAJECTORY           = 4;
+constexpr int     SECTION_SEQUENCEDESCRIPTION  = 5;
 constexpr int     MAX_GRAD_SHOTS               = 16;
 
 // ---------- byte-swap helpers ----------
@@ -296,7 +296,7 @@ SequenceCache read_sequence_cache(const std::string& cache_path)
         sections[i].size   = read_int(f, do_swap);
     }
 
-    // Find sections 2 (GENINSTRUCTIONS), 5 (TRAJECTORY), and 6 (SEQUENCEDESCRIPTION)
+    // Find sections 2 (GENINSTRUCTIONS), 4 (TRAJECTORY), and 5 (SEQUENCEDESCRIPTION)
     const SectionEntry* geninst_section = nullptr;
     const SectionEntry* traj_section    = nullptr;
     const SectionEntry* seqdesc_section = nullptr;
@@ -399,9 +399,10 @@ SequenceCache read_sequence_cache(const std::string& cache_path)
         e.center_sample      = read_int(f, do_swap);
         e.sample_time_us     = read_float(f, do_swap);
         e.encoding_space_ref = read_int(f, do_swap);
+        e.off                = read_int(f, do_swap);
     }
 
-    // Read Section 6 — sequence description (optional; graceful skip if absent)
+    // Read Section 5 — sequence description (optional; graceful skip if absent)
     if (seqdesc_section) {
         f.seekg(seqdesc_section->offset, std::ios::beg);
         if (f.good()) {
