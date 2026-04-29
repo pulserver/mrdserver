@@ -4,8 +4,12 @@
  *
  * Reads sections from the cache:
  *   - Section 2 (GENINSTRUCTIONS): rotation matrices
- *   - Section 5 (TRAJECTORY): kshot library, encoding spaces, table
- *   - Section 6 (SEQUENCEDESCRIPTION): event lists, RF shapes, shims (optional)
+ *   - Section 4 (TRAJECTORY): kshot library, encoding spaces, table
+ *   - Section 5 (SEQUENCEDESCRIPTION): event lists, RF shapes, shims (optional)
+ *
+ * Section 6 (FREQMOD) is intentionally NOT parsed; off-isocenter shifts are
+ * applied PSD-side and data arriving at the recon are already centered.
+ * See pulserverlib-tests/SCHEMA.md for the wire format.
  *
  * No dependency on pulserverlib. All integer and float fields are 4 bytes.
  */
@@ -33,6 +37,7 @@ constexpr int     SECTION_GENINSTRUCTIONS      = 2;
 constexpr int     SECTION_TRAJECTORY           = 4;
 constexpr int     SECTION_SEQUENCEDESCRIPTION  = 5;
 constexpr int     MAX_GRAD_SHOTS               = 16;
+constexpr int     MAX_BANDS                    = 8;
 
 // ---------- byte-swap helpers ----------
 
@@ -91,12 +96,13 @@ std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
     int num_subseq = read_int(f, do_swap);
     skip_ints(f, 5); // remaining collection header fields
 
-    // For each subsequence, skip its info (4 ints) then read the descriptor
-    // We only need the first subsequence's rotations for now
-    for (int s = 0; s < num_subseq; ++s) {
-        // subsequence_info: 4 ints
-        skip_ints(f, 4);
+    // Subsequence-info entries (4 ints each) for ALL subseqs come BEFORE
+    // any descriptor, so we must skip the whole block at once — not
+    // interleave one info + one descriptor per loop iteration.
+    skip_ints(f, num_subseq * 4);
 
+    // We only need the first subsequence's rotations for now.
+    for (int s = 0; s < num_subseq; ++s) {
         // --- Descriptor scalars: 11 ints + 12 floats ---
         skip_ints(f, 11);  // num_prep_blocks..vendor
         skip_ints(f, 12);  // fov[3], matrix[3], nav_fov[3], nav_matrix[3]
@@ -111,8 +117,14 @@ std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
 
         // --- RF definitions ---
         int num_unique_rfs = read_int(f, do_swap);
-        // per rf_def: 6 scalars + 11 from rf_stats = 17 fields
-        skip_ints(f, num_unique_rfs * 17);
+        // Per rf_def layout (must match write_descriptor() in
+        // pulseqlib_cache.c):
+        //   6 scalars (id, mag/phase/time_shape_id, delay, num_channels)
+        // + 11 base stats (flip..num_samples)
+        // + 1 num_bands + MAX_BANDS band_freq_offsets + 2 (band_bw, b1sq)
+        // + 1 vendor tag (v1.3)
+        constexpr int RF_DEF_FIELDS_PER = 6 + 11 + 1 + MAX_BANDS + 2 + 1;
+        skip_ints(f, num_unique_rfs * RF_DEF_FIELDS_PER);
 
         // --- RF table ---
         int rf_table_size = read_int(f, do_swap);
@@ -564,29 +576,32 @@ std::vector<PrecomputedTrajectory> pre_compute_trajectories(const SequenceCache&
                     px[i] = (static_cast<float>(i) - center) / norm;
                 // ky, kz remain zero — rotation will spread kx into the spoke direction
             } else {
-                auto compose = [&](int shot_id, float amp, float* dst) {
+                /* kshot already holds the full-amplitude k-space waveform
+                 * in 1/m (compute_block_kspace integrates g_amp*shape*dt).
+                 * Do NOT multiply by entry.g*_amplitude again — that would
+                 * scale by the gradient amplitude a second time and yield
+                 * ~10^4× too-large k-values for noncartesian fixtures. The
+                 * amplitude field is retained in the table only as a
+                 * trivial-shot indicator. */
+                auto compose = [&](int shot_id, float* dst) {
                     if (shot_id >= 0 && shot_id < static_cast<int>(cache.kshots.size())) {
                         const auto& sk = cache.kshots[shot_id].k;
                         for (int i = 0; i < std::min(nsamples, static_cast<int>(sk.size())); ++i)
-                            dst[i] = sk[i] * amp;
+                            dst[i] = sk[i];
                     }
                 };
-                compose(entry.kx_shot_id, entry.gx_amplitude, px);
-                compose(entry.ky_shot_id, entry.gy_amplitude, py);
-                compose(entry.kz_shot_id, entry.gz_amplitude, pz);
+                compose(entry.kx_shot_id, px);
+                compose(entry.ky_shot_id, py);
+                compose(entry.kz_shot_id, pz);
             }
 
-            if (entry.rotation_id >= 0 &&
-                entry.rotation_id < static_cast<int>(cache.rotations.size()))
-            {
-                const auto& R = cache.rotations[entry.rotation_id];
-                for (int i = 0; i < nsamples; ++i) {
-                    float rx = R[0]*px[i] + R[1]*py[i] + R[2]*pz[i];
-                    float ry = R[3]*px[i] + R[4]*py[i] + R[5]*pz[i];
-                    float rz = R[6]*px[i] + R[7]*py[i] + R[8]*pz[i];
-                    px[i] = rx; py[i] = ry; pz[i] = rz;
-                }
-            }
+            /* NOTE: per-ADC rotation (entry.rotation_id) is intentionally
+             * NOT applied here.  The cache stores k samples in the
+             * LOGICAL gradient frame; rotation (block extension and
+             * base_rot) is composed downstream by livesdk when building
+             * the full physical trajectory.  Applying rotation here would
+             * make this routine's output disagree with the LOGICAL-frame
+             * truth produced by TruthBuilder.exportTrajectory. */
         }
 
         auto is_zero = [](const std::vector<float>& v) {
