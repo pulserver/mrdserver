@@ -4,10 +4,8 @@ import sys
 import types
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from mrdserver.server import Server, _NullHandler
-
 
 # ---------------------------------------------------------------------------
 # Handler resolution
@@ -59,9 +57,7 @@ def test_resolve_handler_null_config():
 def test_resolve_handler_from_handler_dir(tmp_path):
     """Resolves a handler from a .py file in handler_dirs."""
     handler_file = tmp_path / "custom_recon.py"
-    handler_file.write_text(
-        "def process(connection, config, metadata):\n    pass\n"
-    )
+    handler_file.write_text("def process(connection, config, metadata):\n    pass\n")
 
     server = Server.__new__(Server)
     server.default_handler = "savedataonly"

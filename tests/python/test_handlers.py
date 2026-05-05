@@ -1,12 +1,8 @@
 """Tests for mrdserver.handlers — simplefft and fftrecon reconstruction."""
 
-import ctypes
 
 import ismrmrd
 import numpy as np
-import pytest
-
-from mrdserver import constants
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +80,9 @@ def _make_metadata(
 
     lim = ismrmrd.xsd.encodingLimitsType()
     lim.kspace_encoding_step_1 = ismrmrd.xsd.limitType(
-        minimum=0, maximum=n_pe - 1, center=n_pe // 2,
+        minimum=0,
+        maximum=n_pe - 1,
+        center=n_pe // 2,
     )
     enc.encodingLimits = lim
 

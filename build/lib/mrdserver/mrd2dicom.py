@@ -1,33 +1,10 @@
-"""Convert ISMRMRD/MRD images to DICOM format.
+"""MRD Dicom Builder helper."""
 
-This module provides utilities to convert ISMRMRD (``ismrmrd.Image``) objects
-to DICOM datasets (``pydicom.Dataset``), populating DICOM headers from ISMRMRD
-metadata while preserving image pixel data and geometry information.
-
-Classes
--------
-MrdDicomBuilder
-    Stateful converter that maps ISMRMRD XML headers → DICOM datasets,
-    accumulating per-scan instance numbering.
-DicomWithName
-    Lightweight struct coupling a DICOM dataset with a generated filename.
-
-Functions
----------
-to_dicom_date
-    Convert ISMRMRD date values to DICOM DA (YYYYMMDD) format.
-to_dicom_time
-    Convert ISMRMRD time values to DICOM TM (HHMMSS) format.
-convert_string_vrs
-    Recursively enforce string-type value representations in DICOM elements.
-"""
-
-__all__ = ["MrdDicomBuilder", "DicomWithName"]
+__all__ = ["MrdDicomBuilder"]
 
 import copy
 import dataclasses
 import logging
-from typing import Any
 
 import numpy as np
 import pydicom
@@ -37,18 +14,7 @@ import ismrmrd
 
 @dataclasses.dataclass
 class DicomWithName:
-    """DICOM dataset coupled with a generated filename.
-
-    Attributes
-    ----------
-    dset : pydicom.Dataset or None
-        The DICOM dataset, or ``None`` if conversion failed.
-    filename : str
-        Generated filename for the DICOM instance, typically in format
-        ``EX<StudyID>_<SeriesNumber>_<SeriesDescription>_<InstanceNumber>.dcm``.
-    """
-
-    dset: pydicom.Dataset | None
+    dset: pydicom.Dataset
     filename: str
 
 
@@ -90,67 +56,24 @@ STRING_VRS = {
 }
 
 
-def to_dicom_date(value: Any) -> str:
-    """Convert to DICOM DA (YYYYMMDD) format.
-
-    Parameters
-    ----------
-    value : Any
-        Input value, either an ISMRMRD XML date object (XmlDate) or a
-        pre-formatted DICOM date string.
-
-    Returns
-    -------
-    str
-        Date in DICOM DA format (``YYYYMMDD``).
-    """
+def to_dicom_date(value):
+    """Convert to DICOM DA (YYYYMMDD) if necessary"""
     if value.__class__.__name__ == "XmlDate":
         return value.to_date().isoformat().replace("-", "")  # YYYYMMDD
-    return str(value)  # assume it's already in correct format
+    return value  # assume it's already in correct format
 
 
-def to_dicom_time(value: Any) -> str:
-    """Convert to DICOM TM (HHMMSS) format.
-
-    Parameters
-    ----------
-    value : Any
-        Input value, either an ISMRMRD XML time object (XmlTime) or a
-        pre-formatted DICOM time string.
-
-    Returns
-    -------
-    str
-        Time in DICOM TM format (``HHMMSS.ffffff``) or ``HHMMSS`` if
-        no fractional seconds.
-    """
+def to_dicom_time(value):
+    """Convert to DICOM TM (HHMMSS) if necessary"""
     if value.__class__.__name__ == "XmlTime":
         return value.to_time().isoformat().replace(":", "").split(".")[0]  # HHMMSS
-    return str(value)  # assume it's already in correct format
+    return value  # assume it's already in correct format
 
 
-def convert_string_vrs(ds: pydicom.Dataset) -> pydicom.Dataset:
-    """Recursively enforce string-type DICOM value representations.
-
-    Converts numeric values to strings in all DICOM elements marked as
-    string-type value representations (VR).  Handles sequences,
-    multi-valued elements, and PersonName objects.
-
-    Parameters
-    ----------
-    ds : pydicom.Dataset
-        Input DICOM dataset to be modified in-place.
-
-    Returns
-    -------
-    pydicom.Dataset
-        The modified input dataset (same object).
-
-    Notes
-    -----
-    This function recurses into DICOM sequences (VR == "SQ") and processes
-    all elements with string-type VRs (defined in the module-level
-    ``STRING_VRS`` set).
+def convert_string_vrs(ds: pydicom.Dataset):
+    """
+    Recursively convert all string VR elements to Python str if they are not.
+    Handles sequences, multi-valued elements, and PersonName objects.
     """
     for elem in ds:
         # If this element is a sequence, recurse
@@ -179,29 +102,7 @@ def convert_string_vrs(ds: pydicom.Dataset) -> pydicom.Dataset:
 
 
 class MrdDicomBuilder:
-    """Stateful builder for converting ISMRMRD images to DICOM datasets.
-
-    This class maintains a DICOM template and per-scan instance counter,
-    allowing incremental conversion of MRD images while ensuring consistent
-    numbering across a series.
-
-    Parameters
-    ----------
-    mrdHead : ismrmrd.xsd.ismrmrdHeader
-        Parsed ISMRMRD XML header for the measurement.  Used to populate
-        DICOM fields from patient, study, acquisition, and sequence metadata.
-
-    Attributes
-    ----------
-    dicomDset : pydicom.Dataset
-        The DICOM template, updated with metadata from ``mrdHead``.
-    mrdHead : ismrmrd.xsd.ismrmrdHeader
-        Stored reference to the input header.
-    instanceNumber : int
-        Counter that increments after each ``__call__``.
-    """
-
-    def __init__(self, mrdHead: ismrmrd.xsd.ismrmrdHeader) -> None:
+    def __init__(self, mrdHead: ismrmrd.xsd.ismrmrdHeader):
         dicomDset = pydicom.dataset.Dataset()
 
         # Enforce explicit little endian for written DICOM files
@@ -400,36 +301,21 @@ class MrdDicomBuilder:
         self.instanceNumber = 0
 
     def __call__(self, mrdImg: ismrmrd.Image) -> DicomWithName:
-        """Convert a single ISMRMRD image to DICOM.
+        """
+        Perform conversion of a single MRD Image to the corresponding DICOM Dataset.
 
         Parameters
         ----------
-        mrdImg : ismrmrd.Image
-            ISMRMRD image to be converted.  Pixel data and geometry (position,
-            orientation) are extracted; metadata from the image header and
-            attribute string are used to populate DICOM fields.
+        mrdImg : TYPE
+            ISMRMRD Image to be converted.
 
         Returns
         -------
-        DicomWithName
-            Struct containing the output DICOM dataset and generated filename.
-            If conversion fails (e.g. unsupported geometry), ``dset`` will be
-            ``None`` and the filename will be empty.
+        dset : pydicom.Dataset
+            Output DICOM.
+        str
+            DICOM filename.
 
-        Raises
-        ------
-        Exception
-            May raise if ISMRMRD metadata is malformed or DICOM value
-            assignment fails.  Exceptions are logged and processing continues.
-
-        Notes
-        -----
-        - The ``instanceNumber`` is incremented after each successful call.
-        - Image orientation is extracted from the ISMRMRD ImageHeader
-          (ImageRowDir, ImageColumnDir) if present in metadata, otherwise
-          computed from the read and phase direction vectors.
-        - Window width and center are auto-computed from the 5th and 95th
-          percentiles of pixel data if not overridden by metadata.
         """
         dicomDset = copy.deepcopy(self.dicomDset)
         mrdHead = self.mrdHead

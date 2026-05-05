@@ -110,7 +110,7 @@ def get_sequence_resource_paths(metadata):
     """
     return {
         "tensor_dat_path": get_userParameterString_value(metadata, "tensor_dat_path"),
-        "grad_coef_path": get_userParameterString_value(metadata, "grad_coef_path"),
+        "grad_coef_path":  get_userParameterString_value(metadata, "grad_coef_path"),
     }
 
 

@@ -1,8 +1,7 @@
-"""Multi-slice 2D FFT reconstruction with DICOM export.
+"""Simple 2D FFT reconstruction handler.
 
-Accumulates all readouts until ``ACQ_LAST_IN_MEASUREMENT``, reshapes into
-``[cha, RO, PE, SLC]``, applies 2D IFFT + coil combine, and sends back
-DICOM images via the ``mrd2dicom`` converter.
+Accumulates k-space lines per slice, applies 2D IFFT + root-sum-of-squares
+coil combination, and sends back ISMRMRD images.
 """
 
 import logging
@@ -15,11 +14,10 @@ import numpy as np
 import numpy.fft as fft
 
 from .. import mrdhelper
-from ..mrd2dicom import MrdDicomBuilder
 
 
 def process(connection: Any, config: Any, metadata: Any) -> None:
-    """Run multi-slice 2D FFT reconstruction with DICOM export.
+    """Run simple 2D FFT reconstruction.
 
     Parameters
     ----------
@@ -28,22 +26,18 @@ def process(connection: Any, config: Any, metadata: Any) -> None:
     config : Any
         Configuration dict/string from the CONFIG message.
     metadata : Any
-        Parsed ISMRMRD XML header.
+        Parsed ISMRMRD XML header (``ismrmrd.xsd`` object or raw text).
     """
-    logging.info("fftrecon handler — config: %s", config)
-
-    dicom_gen = MrdDicomBuilder(metadata)
+    logging.info("simplefft handler — config: %s", config)
 
     for group in _conditional_groups(
         connection,
-        accept=lambda acq: not acq.is_flag_set(ismrmrd.ACQ_LAST_IN_MEASUREMENT),
-        finish=lambda acq: acq.is_flag_set(ismrmrd.ACQ_LAST_IN_MEASUREMENT),
+        accept=lambda acq: not acq.is_flag_set(ismrmrd.ACQ_IS_PHASECORR_DATA),
+        finish=lambda acq: acq.is_flag_set(ismrmrd.ACQ_LAST_IN_SLICE),
     ):
-        images = _reconstruct(group, metadata)
-        for img_array in images:
-            mrd_image = _array2image(img_array, group, metadata)
-            named_dset = dicom_gen(mrd_image)
-            connection.send(named_dset)
+        image = _reconstruct(group, metadata)
+        if image is not None:
+            connection.send(image)
 
 
 # ------------------------------------------------------------------
@@ -74,64 +68,56 @@ def _conditional_groups(
         iterable.socket.write(end)
 
 
-def _reconstruct(group: list[ismrmrd.Acquisition], metadata: Any) -> np.ndarray:
-    """Reconstruct a stack of per-slice images.
+def _reconstruct(
+    group: list[ismrmrd.Acquisition], metadata: Any
+) -> ismrmrd.Image | None:
+    """Reconstruct a single-slice image from a group of readouts.
 
     Parameters
     ----------
     group : list[ismrmrd.Acquisition]
-        All readout lines in the measurement.
+        Readout lines for one slice.
     metadata : Any
         Parsed ISMRMRD XML header.
 
     Returns
     -------
-    np.ndarray
-        Array of shape ``(n_slices, RO, PE)``, dtype ``int16``.
+    ismrmrd.Image or None
+        Reconstructed image, or ``None`` if *group* is empty.
     """
     if not group:
-        return []
+        return None
 
     logging.info("Reconstructing group of %d readouts", len(group))
 
-    # Stack: [cha, RO, PE*SLC]
+    # Stack: [cha, RO, PE]
     data = np.stack([acq.data for acq in group], axis=-1)
-
-    # Reshape to [cha, RO, PE, SLC]
-    slices = [acq.idx.slice for acq in group]
-    n_slices = max(slices) + 1
-    data = data.reshape(data.shape[0], data.shape[1], -1, n_slices)
-    slice_order = slices[:n_slices]
-    data = data[..., np.argsort(slice_order)]
 
     # 2D IFFT
     data = fft.fftshift(data, axes=(1, 2))
     data = fft.ifft2(data, axes=(1, 2))
     data = fft.ifftshift(data, axes=(1, 2))
 
-    # Root-sum-of-squares coil combine
+    # Root-sum-of-squares coil combination
     data = np.sqrt(np.sum(np.abs(data) ** 2, axis=0))
 
-    # Normalize
+    # Bit depth
     bits = mrdhelper.get_userParameterLong_value(metadata, "BitsStored") or 12
     max_val = 2**bits - 1
     data *= max_val / data.max()
     data = np.around(data).astype(np.int16)
 
-    # Return per-slice images: list of [RO, PE]
-    return data.transpose(2, 0, 1)  # [SLC, RO, PE]
-
-
-def _array2image(
-    data: np.ndarray,
-    group: list[ismrmrd.Acquisition],
-    metadata: Any,
-) -> ismrmrd.Image:
-    """Convert a 2-D pixel array to an ``ismrmrd.Image``."""
+    # Crop readout oversampling
     enc = metadata.encoding[0]
-    image = ismrmrd.Image.from_array(
-        data.transpose(), acquisition=group[0], transpose=False
-    )
+    if enc.reconSpace.matrixSize.x:
+        off = (data.shape[0] - enc.reconSpace.matrixSize.x) // 2
+        data = data[off : off + enc.reconSpace.matrixSize.x, :]
+    if enc.reconSpace.matrixSize.y:
+        off = (data.shape[1] - enc.reconSpace.matrixSize.y) // 2
+        data = data[:, off : off + enc.reconSpace.matrixSize.y]
+
+    # Build ISMRMRD Image
+    image = ismrmrd.Image.from_array(data.transpose(), acquisition=group[0], transpose=False)
     image.image_index = 1
     image.field_of_view = (
         ctypes.c_float(enc.reconSpace.fieldOfView_mm.x),
@@ -140,10 +126,12 @@ def _array2image(
     )
 
     meta = ismrmrd.Meta(
-        {"DataRole": "Image", "ImageProcessingHistory": ["FIRE", "PYTHON"]}
+        {
+            "DataRole": "Image",
+            "ImageProcessingHistory": ["FIRE", "PYTHON"],
+            "WindowCenter": str((max_val + 1) // 2),
+            "WindowWidth": str(max_val + 1),
+        }
     )
-    head = image.getHead()
-    meta["ImageRowDir"] = [f"{head.read_dir[i]:.18f}" for i in range(3)]
-    meta["ImageColumnDir"] = [f"{head.phase_dir[i]:.18f}" for i in range(3)]
     image.attribute_string = meta.serialize()
     return image

@@ -5,7 +5,7 @@
  * (and the analogous TruthBuilder run_generators step).
  *
  * Given a path to a Pulseq .seq file, produces the matching pulseqlib
- * binary cache <base>.bin containing sections 1 (CHECK), 2 (GENINSTR),
+ * binary cache <base>.pge containing sections 1 (CHECK), 2 (GENINSTR),
  * 3 (SCANLOOP), 4 (TRAJECTORY) and 5 (SEQUENCEDESCRIPTION).
  *
  * Lives under mrdserver/tests/ on purpose: examples/ is the reference
@@ -50,7 +50,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s <path/to/sequence.seq>\n"
                 "\n"
-                "Produces <base>.bin in the same directory.\n"
+                "Produces <base>.pge in the same directory.\n"
                 "If <base>_meta.txt exists alongside the .seq and contains a\n"
                 "'num_averages N' line, that NEX is honoured (matches truth).\n",
                 argv[0]);

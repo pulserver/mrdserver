@@ -134,9 +134,7 @@ def build_save_path(metadata: Any, fallback_dir: str) -> str:
             station = metadata.acquisitionSystemInformation.stationName
             if station:
                 # Keep only alphanumeric + underscore; strip leading/trailing underscores
-                scanner_id = (
-                    re.sub(r"[^a-zA-Z0-9_]", "_", station).strip("_") or "unknown"
-                )
+                scanner_id = re.sub(r"[^a-zA-Z0-9_]", "_", station).strip("_") or "unknown"
     except Exception:
         pass
 
@@ -170,9 +168,7 @@ class DataSaver:
         HDF5 group name inside the file.
     """
 
-    def __init__(
-        self, savedataFile: str, savedataFolder: str, savedataGroup: str
-    ) -> None:
+    def __init__(self, savedataFile: str, savedataFolder: str, savedataGroup: str) -> None:
         self.savedataFile = savedataFile
         self.savedataFolder = savedataFolder
         self.savedataGroup = savedataGroup
@@ -185,9 +181,7 @@ class DataSaver:
 
         # Generate a fallback filename if none was supplied
         if not self.savedataFile:
-            self.savedataFile = (
-                "mrd_unknown_" + datetime.now().strftime("%Y%m%dT%H%M%S") + ".h5"
-            )
+            self.savedataFile = "mrd_unknown_" + datetime.now().strftime("%Y%m%dT%H%M%S") + ".h5"
 
         # Full path to the file
         self.mrdFilePath = os.path.join(self.savedataFolder, self.savedataFile)
@@ -226,12 +220,7 @@ class DataSaver:
 class DummySaver:
     """No-op saver used when data saving is disabled."""
 
-    def __init__(
-        self,
-        savedataFile: str = "",
-        savedataFolder: str = "",
-        savedataGroup: str = "dataset",
-    ) -> None:
+    def __init__(self, savedataFile: str = "", savedataFolder: str = "", savedataGroup: str = "dataset") -> None:
         pass
 
     def save(self, mid: int, item: Any) -> None:  # noqa: ARG002
@@ -355,9 +344,7 @@ class Connection:
             except StopIteration:
                 return
 
-    def add_reader(
-        self, mid: int, reader: Callable[..., Any], *args: Any, **kwargs: Any
-    ) -> None:
+    def add_reader(self, mid: int, reader: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         """
         Add a reader to the connection's readers.
 
@@ -380,11 +367,7 @@ class Connection:
         self.readers[mid] = lambda readable: reader(readable, *args, **kwargs)
 
     def add_writer(
-        self,
-        accepts: Callable[[Any], bool],
-        writer: Callable[..., None],
-        *args: Any,
-        **kwargs: Any,
+        self, accepts: Callable[[Any], bool], writer: Callable[..., None], *args: Any, **kwargs: Any
     ) -> None:
         """Add a writer to the connection's writers.
 

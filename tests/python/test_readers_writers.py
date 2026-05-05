@@ -5,7 +5,6 @@ import struct
 
 import ismrmrd
 import numpy as np
-import pytest
 
 from mrdserver import constants
 from mrdserver.readers import (
@@ -25,7 +24,6 @@ from mrdserver.writers import (
     write_vector,
     write_waveform,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -117,7 +117,9 @@ def _reconstruct(
         data = data[:, off : off + enc.reconSpace.matrixSize.y]
 
     # Build ISMRMRD Image
-    image = ismrmrd.Image.from_array(data.transpose(), acquisition=group[0], transpose=False)
+    image = ismrmrd.Image.from_array(
+        data.transpose(), acquisition=group[0], transpose=False
+    )
     image.image_index = 1
     image.field_of_view = (
         ctypes.c_float(enc.reconSpace.fieldOfView_mm.x),

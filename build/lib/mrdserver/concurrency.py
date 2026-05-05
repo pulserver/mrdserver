@@ -29,14 +29,13 @@ def _available_ram_gb() -> float:
     """
     try:
         import psutil  # type: ignore[import-untyped]
-
-        return psutil.virtual_memory().available / (1024**3)
+        return psutil.virtual_memory().available / (1024 ** 3)
     except ImportError:
         pass
     try:
         page_size: int = os.sysconf("SC_PAGE_SIZE")
         avail_pages: int = os.sysconf("SC_AVPHYS_PAGES")
-        return page_size * avail_pages / (1024**3)
+        return page_size * avail_pages / (1024 ** 3)
     except (AttributeError, ValueError, OSError):
         return 0.0
 

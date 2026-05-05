@@ -4,7 +4,6 @@ Constants for ISMRMRD message handling.
 This module defines constants for Gadgetron and ISMRMRD message identifiers,
 struct formats for binary data serialization, and logging severity levels.
 """
-
 import struct
 
 # Gadgetron message identifiers
@@ -44,7 +43,7 @@ GADGET_MESSAGE_ISMRMRD_IMAGE = 1022
 GADGET_MESSAGE_RECON_DATA = 1023
 GADGET_MESSAGE_IMAGE_ARRAY = 1024
 GADGET_MESSAGE_ISMRMRD_WAVEFORM = 1026
-GADGET_MESSAGE_PMC_PAYLOAD = 1027  # PMC correction feedback: PmcPayload struct
+GADGET_MESSAGE_PMC_PAYLOAD      = 1027  # PMC correction feedback: PmcPayload struct
 GADGET_MESSAGE_BUCKET = 1050
 GADGET_MESSAGE_EXT_ID_MAX = 4096
 

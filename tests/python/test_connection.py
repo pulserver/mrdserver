@@ -2,12 +2,9 @@
 
 import io
 import socket
-import struct
-import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import ismrmrd
-import numpy as np
 import pytest
 
 from mrdserver import constants
@@ -19,7 +16,6 @@ from mrdserver.connection import (
     MID_TO_TYPE,
     NAME_TO_TYPE,
 )
-
 
 # ---------------------------------------------------------------------------
 # MessageType
@@ -63,7 +59,9 @@ def test_dummy_saver_noop():
 
 def test_data_saver_creates_file(tmp_path):
     folder = str(tmp_path / "output")
-    saver = DataSaver(savedataFile="test.h5", savedataFolder=folder, savedataGroup="dataset")
+    saver = DataSaver(
+        savedataFile="test.h5", savedataFolder=folder, savedataGroup="dataset"
+    )
     saver.create_save_file()
     assert saver.dset is not None
     assert (tmp_path / "output" / "test.h5").exists()
@@ -81,7 +79,9 @@ def test_data_saver_autogen_filename(tmp_path):
 
 def test_data_saver_save_acquisition(tmp_path):
     folder = str(tmp_path)
-    saver = DataSaver(savedataFile="acq.h5", savedataFolder=folder, savedataGroup="dataset")
+    saver = DataSaver(
+        savedataFile="acq.h5", savedataFolder=folder, savedataGroup="dataset"
+    )
 
     acq = ismrmrd.Acquisition()
     acq.resize(64, 1)
@@ -125,7 +125,9 @@ def _make_connection_pair(
 def test_connection_receives_close():
     conn, peer = _make_connection_pair()
     try:
-        peer.sendall(constants.GadgetMessageIdentifier.pack(constants.GADGET_MESSAGE_CLOSE))
+        peer.sendall(
+            constants.GadgetMessageIdentifier.pack(constants.GADGET_MESSAGE_CLOSE)
+        )
 
         _mid, item = conn.next()
         assert conn.is_exhausted
@@ -274,6 +276,7 @@ def test_connection_filter():
         peer.setblocking(False)
         bounced = b""
         import select
+
         while True:
             r, _, _ = select.select([peer], [], [], 0.5)
             if not r:
@@ -293,9 +296,7 @@ def test_connection_filter():
 
 
 def test_connection_with_savedata(tmp_path):
-    conn, peer = _make_connection_pair(
-        savedata=True, savedataFolder=str(tmp_path)
-    )
+    conn, peer = _make_connection_pair(savedata=True, savedataFolder=str(tmp_path))
     try:
         # Send acquisition + close
         acq = ismrmrd.Acquisition()

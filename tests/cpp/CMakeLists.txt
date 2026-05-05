@@ -48,7 +48,7 @@ target_include_directories(test_trajectory_cache_loader PRIVATE
     ${ISMRMRD_INCLUDE_DIRS}
     ${Boost_INCLUDE_DIRS})
 
-# Path to the .bin fixtures, baked in at configure time.
+# Path to the .pge fixtures, baked in at configure time.
 target_compile_definitions(test_trajectory_cache_loader PRIVATE
     MRDSERVER_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../pulserverlib-tests/expected")
 

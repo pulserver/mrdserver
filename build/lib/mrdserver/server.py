@@ -103,7 +103,6 @@ class Server:
             if handler_mod is not None:
                 break
             import os
-
             path = os.path.join(d, self.rtp_handler + ".py")
             if os.path.isfile(path):
                 handler_mod = self._load_from_file(self.rtp_handler, path)
@@ -113,11 +112,8 @@ class Server:
             handler_module=handler_mod,
         )
         self._rtp_server.serve_in_thread()
-        logging.info(
-            "RTP PMC server started on port %d (handler: %s)",
-            self.rtp_port,
-            self.rtp_handler,
-        )
+        logging.info("RTP PMC server started on port %d (handler: %s)",
+                     self.rtp_port, self.rtp_handler)
 
     def serve(self) -> None:
         """Block and accept connections until interrupted."""
@@ -134,7 +130,6 @@ class Server:
 
         # Start the offline-replay worker (daemon thread — exits when server exits)
         from .replay import ReplayWorker
-
         self._replay_worker = ReplayWorker(self)
         self._replay_worker.start()
 
@@ -163,7 +158,9 @@ class Server:
             except OSError:
                 break
 
-            logging.info("Accepted connection from %s:%d", remote_addr, remote_port)
+            logging.info(
+                "Accepted connection from %s:%d", remote_addr, remote_port
+            )
             t = threading.Thread(
                 target=self._handle_connection,
                 args=(sock,),
@@ -203,10 +200,7 @@ class Server:
             # Parse header
             try:
                 metadata = ismrmrd.xsd.CreateFromDocument(metadata_xml)
-                if (
-                    metadata.acquisitionSystemInformation.systemFieldStrength_T
-                    is not None
-                ):
+                if metadata.acquisitionSystemInformation.systemFieldStrength_T is not None:
                     logging.info(
                         "Data from %s %s at %1.1fT",
                         metadata.acquisitionSystemInformation.systemVendor,
@@ -263,11 +257,10 @@ class Server:
                     connection.saver.dset.close()
                 except Exception:
                     pass
-            if (
-                hasattr(connection.saver, "mrdFilePath")
-                and connection.saver.mrdFilePath
-            ):
-                logging.info("Incoming data saved at %s", connection.saver.mrdFilePath)
+            if hasattr(connection.saver, "mrdFilePath") and connection.saver.mrdFilePath:
+                logging.info(
+                    "Incoming data saved at %s", connection.saver.mrdFilePath
+                )
 
     # ------------------------------------------------------------------
     # Overflow: drain to disk and queue for later replay
@@ -294,10 +287,7 @@ class Server:
         # Extract bucket_pid for the sidecar (informational)
         bucket_pid: str | None = None
         try:
-            if (
-                hasattr(metadata, "userParameters")
-                and metadata.userParameters is not None
-            ):
+            if hasattr(metadata, "userParameters") and metadata.userParameters is not None:
                 for p in metadata.userParameters.userParameterString:
                     if p.name == "bucket_pid":
                         bucket_pid = p.value
@@ -317,9 +307,7 @@ class Server:
                 try:
                     saver.dset.write_xml_header(metadata_xml)
                 except Exception as exc:
-                    logging.warning(
-                        "Could not write XML header to queued file: %s", exc
-                    )
+                    logging.warning("Could not write XML header to queued file: %s", exc)
             # Drain all remaining acquisitions / waveforms from the stream
             for mid, item in connection.iter_with_mids():
                 saver.save(mid, item)

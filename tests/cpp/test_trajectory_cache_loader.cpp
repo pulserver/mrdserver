@@ -2,9 +2,9 @@
 //
 // GoogleTest suite for the standalone trajectory cache reader.
 //
-// Iterates every .bin fixture in pulserverlib-tests/expected/, parses it via
+// Iterates every .pge fixture in pulserverlib-tests/expected/, parses it via
 // read_sequence_cache(), pre-computes per-encoding-space trajectories, and
-// asserts structural invariants. When a companion <stem>_trajectory.bin
+// asserts structural invariants. When a companion <stem>_trajectory.truth
 // truth file exists (Phase B), this test will additionally compare the
 // pre-computed trajectory bytes against the reference (not implemented in
 // Phase A — see PLAN.md).
@@ -29,7 +29,7 @@ namespace fs = std::filesystem;
 namespace
 {
 
-    /** Collect every .bin fixture under MRDSERVER_FIXTURES_DIR sorted by name. */
+    /** Collect every .pge fixture under MRDSERVER_FIXTURES_DIR sorted by name. */
     std::vector<fs::path> discover_fixtures()
     {
         std::vector<fs::path> out;
@@ -52,7 +52,7 @@ namespace
             if (!entry.is_regular_file())
                 continue;
             const auto &p = entry.path();
-            if (p.extension() != ".bin")
+            if (p.extension() != ".pge")
                 continue;
             const std::string stem = p.stem().string();
             bool skip = false;
@@ -319,11 +319,11 @@ namespace
         }
 
         /* ------------------------------------------------------------------ */
-        /*  Phase B: compare against MATLAB-generated _trajectory.bin truth.  */
+        /*  Phase B: compare against MATLAB-generated _trajectory.truth truth.  */
         /* ------------------------------------------------------------------ */
         fs::path truth_path = cache_path;
         truth_path.replace_extension("");
-        truth_path += "_trajectory.bin";
+        truth_path += "_trajectory.truth";
         TruthTrajectory truth = load_truth_trajectory(truth_path);
         if (!truth.has)
             return; /* No companion truth — fixture exempt. */

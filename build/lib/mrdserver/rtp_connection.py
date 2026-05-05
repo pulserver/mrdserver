@@ -38,21 +38,21 @@ from .readers import read_acquisition, read_header
 
 _PMC_STRUCT = struct.Struct("<12fi")  # shift(3f) + rotation(9f) + rescan(i) = 52 bytes
 
-
 @dataclass
 class PmcPayload:
     """Rigid-body motion correction parameters returned to PSD."""
-
-    shift: "list[float]" = None  # translation delta [m]   (3 values)
-    rotation: "list[float]" = None  # 3×3 rotation matrix, row-major (9 values)
-    rescan: int = 0  # non-zero → request TR rescan
+    shift: "list[float]" = None          # translation delta [m]   (3 values)
+    rotation: "list[float]" = None       # 3×3 rotation matrix, row-major (9 values)
+    rescan: int = 0                      # non-zero → request TR rescan
 
     def __post_init__(self):
         if self.shift is None:
             self.shift = [0.0, 0.0, 0.0]
         if self.rotation is None:
             # identity matrix
-            self.rotation = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+            self.rotation = [1.0, 0.0, 0.0,
+                             0.0, 1.0, 0.0,
+                             0.0, 0.0, 1.0]
 
 
 def write_pmc_payload(writable, payload: PmcPayload) -> None:
@@ -83,7 +83,6 @@ def _read_pmc_payload(readable) -> PmcPayload:
 # ---------------------------------------------------------------------------
 # RtpConnection wrapper (single accepted socket)
 # ---------------------------------------------------------------------------
-
 
 class RtpConnection:
     """Wraps a single RTP client socket.
@@ -156,7 +155,6 @@ class RtpConnection:
 # RtpServer — tcp listener, singleton connection
 # ---------------------------------------------------------------------------
 
-
 class RtpServer:
     """TCP server that accepts a single RTP client connection at a time.
 
@@ -223,9 +221,7 @@ class RtpServer:
             if mid == constants.GADGET_MESSAGE_CONFIG:
                 size_bytes = conn._sw.read(constants.SIZEOF_GADGET_MESSAGE_LENGTH)
                 (size,) = constants.GadgetMessageLength.unpack(size_bytes)
-                config = (
-                    conn._sw.read(size).decode("utf-8", errors="replace").rstrip("\x00")
-                )
+                config = conn._sw.read(size).decode("utf-8", errors="replace").rstrip("\x00")
             else:
                 config = "pmcrecon"
 

@@ -38,7 +38,6 @@ _PULSERVER_BASE = os.environ.get("PULSERVER_BASE", "/export/home/sdc/pulserver")
 # enqueue — atomic sidecar writer
 # ---------------------------------------------------------------------------
 
-
 def enqueue(mrd_path: str, handler_name: str, bucket_pid: str | None) -> str:
     """Write a ``*.queued.json`` sidecar next to *mrd_path*, atomically.
 
@@ -85,7 +84,6 @@ def enqueue(mrd_path: str, handler_name: str, bucket_pid: str | None) -> str:
 # ---------------------------------------------------------------------------
 # ReplayConnection
 # ---------------------------------------------------------------------------
-
 
 class ReplayConnection:
     """Connection-like facade that reads from a saved ISMRMRD HDF5 file.
@@ -151,7 +149,6 @@ class ReplayConnection:
         """Route handler output to *output_dir* instead of a TCP socket."""
         try:
             from .mrd2dicom import DicomWithName
-
             if isinstance(item, DicomWithName):
                 out_path = os.path.join(self._output_dir, item.filename)
                 item.dataset.save_as(out_path)
@@ -174,9 +171,7 @@ class ReplayConnection:
             logging.info("ReplayConnection: handler message: %s", item)
             return
 
-        logging.warning(
-            "ReplayConnection: unhandled output type %s", type(item).__name__
-        )
+        logging.warning("ReplayConnection: unhandled output type %s", type(item).__name__)
 
     def filter(self, predicate: Any) -> None:
         """No-op: replay does not filter items."""
@@ -191,10 +186,8 @@ class ReplayConnection:
 # ReplayWorker
 # ---------------------------------------------------------------------------
 
-
 def _sidecar_suffix_re():
     import re
-
     return re.compile(r"\.(queued|processing)\.json$")
 
 

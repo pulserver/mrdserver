@@ -7,15 +7,9 @@ name = "mrdserver"
 version = "0.1.0"
 description = "ISMRMRD/MRD streaming reconstruction server"
 readme = "README.md"
-license = {text = "MIT"}
+license = { text = "MIT" }
 requires-python = ">=3.10"
-dependencies = [
-    "numpy",
-    "ismrmrd>=1.14.1",
-    "pydicom",
-    "h5py",
-    "psutil",
-]
+dependencies = ["numpy", "ismrmrd>=1.14.1", "pydicom", "h5py", "psutil"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
@@ -24,6 +18,7 @@ xml = ["xmltodict"]
 
 [project.scripts]
 mrdserver = "mrdserver.main:main"
+dicom2mrd = "mrdserver.dicom2mrd:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]

@@ -1,14 +1,14 @@
 // test_seq_desc_truth.cpp
 //
 // Parameterized gtest that, for every pulseqlib cache fixture in
-// MRDSERVER_FIXTURES_DIR with a matching <stem>_seq_desc.bin truth
+// MRDSERVER_FIXTURES_DIR with a matching <stem>_seq_desc.truth truth
 // companion:
 //
-//   1. opens the cache .bin
+//   1. opens the cache .pge
 //   2. parses its 6-int header + section index
 //   3. locates section 5 (SEQUENCEDESCRIPTION) by id
 //   4. reads exactly section.size bytes starting at section.offset
-//   5. reads the entire truth <stem>_seq_desc.bin payload
+//   5. reads the entire truth <stem>_seq_desc.truth payload
 //   6. parses both Section 5 wire-format payloads in parallel and
 //      asserts per-field equality:
 //        - integers: exact
@@ -27,7 +27,7 @@
 // integrates in double precision before single-cast on write; the two
 // pipelines therefore agree to within a few ULPs but not byte-for-byte.
 //
-// Fixtures lacking a _seq_desc.bin companion are silently skipped.
+// Fixtures lacking a _seq_desc.truth companion are silently skipped.
 
 #include <gtest/gtest.h>
 
@@ -97,7 +97,7 @@ namespace
             if (!entry.is_regular_file())
                 continue;
             const auto &p = entry.path();
-            if (p.extension() != ".bin")
+            if (p.extension() != ".pge")
                 continue;
             const std::string stem = p.stem().string();
 
@@ -115,8 +115,8 @@ namespace
             if (is_truth)
                 continue;
 
-            // Require companion _seq_desc.bin on disk.
-            const fs::path truth = p.parent_path() / (stem + "_seq_desc.bin");
+            // Require companion _seq_desc.truth on disk.
+            const fs::path truth = p.parent_path() / (stem + "_seq_desc.truth");
             if (!fs::exists(truth))
                 continue;
 
@@ -451,7 +451,7 @@ namespace
     {
         const fs::path cache_path = GetParam();
         const fs::path truth_path =
-            cache_path.parent_path() / (cache_path.stem().string() + "_seq_desc.bin");
+            cache_path.parent_path() / (cache_path.stem().string() + "_seq_desc.truth");
 
         ASSERT_TRUE(fs::exists(truth_path)) << truth_path;
 

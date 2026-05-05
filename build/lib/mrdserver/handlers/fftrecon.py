@@ -74,7 +74,9 @@ def _conditional_groups(
         iterable.socket.write(end)
 
 
-def _reconstruct(group: list[ismrmrd.Acquisition], metadata: Any) -> np.ndarray:
+def _reconstruct(
+    group: list[ismrmrd.Acquisition], metadata: Any
+) -> np.ndarray:
     """Reconstruct a stack of per-slice images.
 
     Parameters
@@ -129,9 +131,7 @@ def _array2image(
 ) -> ismrmrd.Image:
     """Convert a 2-D pixel array to an ``ismrmrd.Image``."""
     enc = metadata.encoding[0]
-    image = ismrmrd.Image.from_array(
-        data.transpose(), acquisition=group[0], transpose=False
-    )
+    image = ismrmrd.Image.from_array(data.transpose(), acquisition=group[0], transpose=False)
     image.image_index = 1
     image.field_of_view = (
         ctypes.c_float(enc.reconSpace.fieldOfView_mm.x),
