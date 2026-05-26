@@ -302,6 +302,11 @@ class Connection:
 
         # Connection state
         self.is_exhausted = False
+        # Set to True only when the socket is physically closed (shutdown_close).
+        # is_exhausted controls reading; _send_closed controls sending.
+        # Receiving CLOSE from the client exhausts reading but must NOT prevent
+        # the server from sending results back before the server-side CLOSE.
+        self._send_closed = False
 
         # Auto-read config and header if enabled (for server-side)
         if auto_read_config_header:
@@ -444,8 +449,8 @@ class Connection:
         ValueError
             If the connection is exhausted.
         """
-        if self.is_exhausted:
-            error = ValueError("Cannot send on an exhausted connection.")
+        if self._send_closed:
+            error = ValueError("Cannot send on a closed connection.")
             logging.error(error)
             raise error
         with self.lock:
@@ -532,18 +537,30 @@ class Connection:
         """
         Gracefully shuts down the socket and closes the connection.
 
-        This method performs a shutdown on the socket to stop sending/receiving data,
-        then closes it. It handles cases where the socket might already be closed.
+        Sends the protocol-level CLOSE message first so the remote peer (e.g.
+        GadgetronClientConnector on the C++ side) receives it before the TCP
+        connection is torn down.  Without this ordering the remote connector.wait()
+        loop never gets the close token and blocks indefinitely.
         """
+        # 1. Send protocol CLOSE before any OS-level shutdown.
+        try:
+            end = constants.GadgetMessageIdentifier.pack(constants.GADGET_MESSAGE_CLOSE)
+            self.socket.socket.sendall(end)
+        except OSError:
+            pass
+        # 2. Shut down the socket (both directions).
         try:
             self.socket.socket.shutdown(socket.SHUT_RDWR)
         except OSError:
-            # Socket might already be closed or shut down
             pass
-        finally:
-            self.socket.close()
-            self.is_exhausted = True
-            logging.info("Socket closed")
+        # 3. Close the raw socket.
+        try:
+            self.socket.socket.close()
+        except OSError:
+            pass
+        self.is_exhausted = True
+        self._send_closed = True
+        logging.info("Socket closed")
 
     def _peek_message_identifier(self) -> int | None:
         try:

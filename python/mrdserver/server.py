@@ -362,6 +362,21 @@ class Server:
         ModuleType
             A module exposing a ``process(connection, config, metadata)`` callable.
         """
+        # Direct absolute file path — load without the import system.
+        # This handles custom recon scripts whose path is sent verbatim by the C++ client
+        # (e.g. /workspace/.../recon/recon42.py).  Using _load_from_file avoids the
+        # import-system which would mis-interpret a filesystem path as a module name.
+        if config and os.path.isabs(config) and config.endswith('.py') and os.path.isfile(config):
+            name = os.path.splitext(os.path.basename(config))[0]
+            mod = self._load_from_file(name, config)
+            if mod is not None:
+                return mod
+            logging.warning(
+                "Handler file '%s' could not be loaded — falling back to '%s'",
+                config,
+                self.default_handler,
+            )
+
         # Fast path: try standard import
         if config and config != "null":
             mod = self._try_import(config)

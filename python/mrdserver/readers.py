@@ -404,9 +404,12 @@ def read_config_text(source: Any) -> dict:
     return config_dict
 
 
-def read_config_file(source: Any) -> dict:
+def read_config_file(source: Any) -> str:
     """
-    Read and deserialize config from file path in the source.
+    Read the Gadgetron configuration filename from the source.
+
+    The wire format is a fixed 1024-byte ``GadgetMessageConfigurationFile``
+    struct (a null-padded char array), NOT a length-prefixed string.
 
     Parameters
     ----------
@@ -415,15 +418,12 @@ def read_config_file(source: Any) -> dict:
 
     Returns
     -------
-    dict
-        The deserialized config dict.
+    str
+        The configuration filename / handler module name.
     """
-    filename_length = read(source, constants.uint32)
-    filename_bytes = source.read(filename_length)
-    filename = filename_bytes.decode("utf-8").rstrip("\x00")
-    config_dict = _load_config_from_file(filename, "default")
-    # Note: raw_bytes.config would be handled in Connection if needed
-    return config_dict
+    config_file_bytes = read(source, constants.GadgetMessageConfigurationFile)
+    filename = config_file_bytes.decode("utf-8").rstrip("\x00")
+    return filename
 
 
 def read_header(source: Any) -> Any:
