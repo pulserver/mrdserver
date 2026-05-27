@@ -33,7 +33,6 @@ import functools
 import io
 import json
 import logging
-import tomllib
 import xml.etree.ElementTree as xml
 
 from typing import Any, Callable
@@ -494,14 +493,6 @@ def _deserialize_config(content: str, default_config: str = "default") -> dict:
         logging.debug("Parsed config as JSON")
         return _gadgetron2mrd(config_dict)
     except json.JSONDecodeError:
-        pass
-
-    # Try TOML
-    try:
-        config_dict = tomllib.loads(content)
-        logging.debug("Parsed config as TOML")
-        return _gadgetron2mrd(config_dict)
-    except tomllib.TOMLDecodeError:
         pass
 
     # Try YAML (if available)
