@@ -3,11 +3,12 @@
  * @brief Standalone reader for pulseqlib binary cache trajectory data.
  *
  * No dependency on pulserverlib — reads the binary cache format directly.
- * Reads section 2 (GENINSTRUCTIONS) for rotation matrices,
- * section 4 (TRAJECTORY) for kshot library, encoding spaces, and table,
- * and section 5 (SEQUENCEDESCRIPTION) when present.
+ * Reads section 1 (COMMON) for per-RF-definition bandwidth and the generic
+ * [DEFINITIONS] map, section 2 (ROTATIONS) for the rotation-matrix library,
+ * section 6 (TRAJECTORY) for the kshot library, encoding spaces, and table,
+ * and section 7 (SEQDESC) when present.
  *
- * Section 6 (FREQMOD / off-isocenter shift) is intentionally NOT parsed:
+ * Section 5 (FREQMOD / off-isocenter shift) is intentionally NOT parsed:
  * frequency modulation is applied PSD-side, so data arriving at the
  * recon are already centered. See pulserverlib-tests/SCHEMA.md.
  */

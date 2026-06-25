@@ -5,11 +5,11 @@
 // companion:
 //
 //   1. opens the cache .pge
-//   2. parses its 6-int header + section index
-//   3. locates section 5 (SEQUENCEDESCRIPTION) by id
+//   2. parses its 7-int header + section index
+//   3. locates section 7 (SEQDESC) by id
 //   4. reads exactly section.size bytes starting at section.offset
 //   5. reads the entire truth <stem>_seq_desc.truth payload
-//   6. parses both Section 5 wire-format payloads in parallel and
+//   6. parses both SEQDESC wire-format payloads in parallel and
 //      asserts per-field equality:
 //        - integers: exact
 //        - floats:   |a-b| <= max(SEQDESC_FLOAT_ABS_TOL,
@@ -47,7 +47,7 @@ namespace
 {
 
     constexpr int32_t CACHE_ENDIAN_MARKER = 0x01020304;
-    constexpr int SECTION_SEQUENCEDESCRIPTION = 5;
+    constexpr int SECTION_SEQUENCEDESCRIPTION = 7;
     constexpr int PULSEQLIB_SEQ_EVENT_PARAMS = 7;
 
     /* Tolerances for tolerant float comparison.
@@ -154,10 +154,12 @@ namespace
             do_swap = true;
         }
 
-        int32_t version_major, version_minor, vendor, stored_size, num_sections;
+        int32_t version_major, version_minor, version_revision, vendor, stored_size, num_sections;
         if (!read4_one(f, &version_major, do_swap))
             return out;
         if (!read4_one(f, &version_minor, do_swap))
+            return out;
+        if (!read4_one(f, &version_revision, do_swap))
             return out;
         if (!read4_one(f, &vendor, do_swap))
             return out;
@@ -457,8 +459,8 @@ namespace
 
         SeqDescSection sec = locate_seqdesc_section(cache_path);
         ASSERT_TRUE(sec.found)
-            << "Section 5 (SEQUENCEDESCRIPTION) not present in " << cache_path;
-        ASSERT_GT(sec.size, 0) << "Section 5 has zero size in " << cache_path;
+            << "Section 7 (SEQDESC) not present in " << cache_path;
+        ASSERT_GT(sec.size, 0) << "Section 7 (SEQDESC) has zero size in " << cache_path;
 
         std::vector<uint8_t> cache_bytes = read_blob(cache_path, sec.offset, sec.size);
         std::vector<uint8_t> truth_bytes = read_all(truth_path);

@@ -3,11 +3,12 @@
  * @brief Standalone reader for pulseqlib binary cache.
  *
  * Reads sections from the cache:
- *   - Section 2 (GENINSTRUCTIONS): rotation matrices
- *   - Section 4 (TRAJECTORY): kshot library, encoding spaces, table
- *   - Section 5 (SEQUENCEDESCRIPTION): event lists, RF shapes, shims (optional)
+ *   - Section 1 (COMMON): per-RF-definition bandwidth + generic [DEFINITIONS]
+ *   - Section 2 (ROTATIONS): rotation-matrix library
+ *   - Section 6 (TRAJECTORY): kshot library, encoding spaces, table
+ *   - Section 7 (SEQDESC): event lists, RF shapes, shims (optional)
  *
- * Section 6 (FREQMOD) is intentionally NOT parsed; off-isocenter shifts are
+ * Section 5 (FREQMOD) is intentionally NOT parsed; off-isocenter shifts are
  * applied PSD-side and data arriving at the recon are already centered.
  * See pulserverlib-tests/SCHEMA.md for the wire format.
  *
@@ -35,9 +36,10 @@ namespace mrdserver
     {
 
         constexpr int32_t CACHE_ENDIAN_MARKER = 0x01020304;
-        constexpr int SECTION_GENINSTRUCTIONS = 2;
-        constexpr int SECTION_TRAJECTORY = 4;
-        constexpr int SECTION_SEQUENCEDESCRIPTION = 5;
+        constexpr int SECTION_COMMON = 1;
+        constexpr int SECTION_ROTATIONS = 2;
+        constexpr int SECTION_TRAJECTORY = 6;
+        constexpr int SECTION_SEQUENCEDESCRIPTION = 7;
         constexpr int MAX_GRAD_SHOTS = 16;
         constexpr int MAX_BANDS = 8;
 
@@ -91,19 +93,21 @@ namespace mrdserver
                 throw std::runtime_error("unexpected EOF skipping ints");
         }
 
-        // ---------- read descriptor data from GENINSTRUCTIONS (section 2) ----------
+        // ---------- read descriptor metadata from COMMON (section 1) ----------
 
-        // Returns rotation matrices and (via out param) per-rf-def bandwidth_hz map.
-        std::vector<std::array<float, 9>> read_rotations_from_geninstructions(
+        // Walks the first subsequence's COMMON descriptor to extract the
+        // per-rf-def bandwidth_hz map (via out param) and the generic
+        // [DEFINITIONS] map (into cache.definitions). Rotation matrices, raw
+        // shapes and the scan table live in their own sections (ROTATIONS,
+        // SHAPES, SCANLOOP) and are NOT walked here.
+        void read_metadata_from_common(
             std::ifstream &f, long section_offset, int section_size, bool do_swap,
             SequenceCache &cache,
             std::map<int, float> &out_rf_bandwidth_hz)
         {
-            std::vector<std::array<float, 9>> rotations;
-
             f.seekg(section_offset, std::ios::beg);
             if (!f.good())
-                throw std::runtime_error("cannot seek to GENINSTRUCTIONS");
+                throw std::runtime_error("cannot seek to COMMON");
             (void)section_size;
 
             // First, skip the collection-level header (6 ints):
@@ -117,7 +121,7 @@ namespace mrdserver
             // interleave one info + one descriptor per loop iteration.
             skip_ints(f, num_subseq * 4);
 
-            // We only need the first subsequence's rotations for now.
+            // We only need the first subsequence's metadata for now.
             for (int s = 0; s < num_subseq; ++s)
             {
                 // --- Descriptor scalars: 11 ints + 12 floats ---
@@ -189,35 +193,19 @@ namespace mrdserver
                     skip_ints(f, nch * 2); // magnitudes[nch] + phases[nch]
                 }
 
-                // --- Rotations ---
-                int num_rotations = read_int(f, do_swap);
-                rotations.resize(static_cast<size_t>(num_rotations));
-                for (int r = 0; r < num_rotations; ++r)
-                {
-                    if (!read4(f, rotations[r].data(), 9))
-                        throw std::runtime_error("EOF reading rotations");
-                    if (do_swap)
-                        swap4_array(rotations[r].data(), 9);
-                }
+                // --- Rotations: live in the ROTATIONS section (read separately) ---
 
                 // --- Triggers ---
                 int num_triggers = read_int(f, do_swap);
                 skip_ints(f, num_triggers * 5);
 
-                // --- Shapes ---
-                int num_shapes = read_int(f, do_swap);
-                for (int sh = 0; sh < num_shapes; ++sh)
-                {
-                    skip_ints(f, 1); // num_uncompressed_samples
-                    int ns = read_int(f, do_swap);
-                    if (ns > 0)
-                        skip_ints(f, ns);
-                }
+                // --- Shapes: live in the SHAPES section (not walked here) ---
 
                 // --- TR descriptor (10 fields) ---
                 skip_ints(f, 10);
 
-                // --- Segment definitions ---
+                // --- Segment definitions (must match write_descriptor() in
+                //     pulseqlib_cache.c) ---
                 {
                     int num_segs_def = read_int(f, do_swap);
                     for (int sg = 0; sg < num_segs_def; ++sg)
@@ -226,8 +214,20 @@ namespace mrdserver
                         int seg_nblocks = read_int(f, do_swap);
                         skip_ints(f, 1); // max_energy_start_block
                         if (seg_nblocks > 0)
-                            skip_ints(f, seg_nblocks * 5); // 5 arrays × num_blocks
+                            skip_ints(f, seg_nblocks * 7); // 7 arrays × num_blocks:
+                                                           // unique_block_indices + has_digitalout
+                                                           // + has_rotation + norot + nopos
+                                                           // + has_freq_mod + has_adc
                         skip_ints(f, 2);                   // trigger_id, is_nav
+                        // Segment timing anchors (cache v1.7+): num_rf_anchors,
+                        // rf_anchors (6 words each), num_adc_anchors, adc_anchors
+                        // (5 words each). See pulseqlib_segment_{rf,adc}_anchor.
+                        int seg_num_rf = read_int(f, do_swap);
+                        if (seg_num_rf > 0)
+                            skip_ints(f, seg_num_rf * 6);
+                        int seg_num_adc = read_int(f, do_swap);
+                        if (seg_num_adc > 0)
+                            skip_ints(f, seg_num_adc * 5);
                     }
                 }
 
@@ -288,15 +288,39 @@ namespace mrdserver
                     }
                 }
 
-                // --- Scan table (skip) ---
-                {
-                    int scan_len = read_int(f, do_swap);
-                    if (scan_len > 0)
-                        skip_ints(f, scan_len * 3); // block_idx, tr_id, seg_id
-                }
+                // --- Scan table: lives in the SCANLOOP section (not walked here) ---
 
                 // Only read first subsequence
                 break;
+            }
+        }
+
+        // ---------- read the ROTATIONS section (section 2) ----------
+
+        // Augment-section layout: [num_subsequences][per descriptor:
+        // num_rotations + num_rotations*9 floats]. We keep the first
+        // subsequence's matrices (matches the previous behaviour).
+        std::vector<std::array<float, 9>> read_rotations_section(
+            std::ifstream &f, long section_offset, bool do_swap)
+        {
+            std::vector<std::array<float, 9>> rotations;
+
+            f.seekg(section_offset, std::ios::beg);
+            if (!f.good())
+                throw std::runtime_error("cannot seek to ROTATIONS");
+
+            int num_subseq = read_int(f, do_swap);
+            if (num_subseq <= 0)
+                return rotations;
+
+            int num_rotations = read_int(f, do_swap);
+            rotations.resize(static_cast<size_t>(num_rotations));
+            for (int r = 0; r < num_rotations; ++r)
+            {
+                if (!read4(f, rotations[r].data(), 9))
+                    throw std::runtime_error("EOF reading rotations");
+                if (do_swap)
+                    swap4_array(rotations[r].data(), 9);
             }
 
             return rotations;
@@ -330,12 +354,14 @@ namespace mrdserver
 
         int version_major = read_int(f, do_swap);
         int version_minor = read_int(f, do_swap);
+        int version_revision = read_int(f, do_swap);
         int vendor = read_int(f, do_swap);
         int stored_size = read_int(f, do_swap);
         int num_sections = read_int(f, do_swap);
 
         (void)version_major;
         (void)version_minor;
+        (void)version_revision;
         (void)vendor;
         (void)stored_size;
 
@@ -355,14 +381,17 @@ namespace mrdserver
             sections[i].size = read_int(f, do_swap);
         }
 
-        // Find sections 2 (GENINSTRUCTIONS), 4 (TRAJECTORY), and 5 (SEQUENCEDESCRIPTION)
-        const SectionEntry *geninst_section = nullptr;
+        // Find sections 1 (COMMON), 2 (ROTATIONS), 6 (TRAJECTORY), 7 (SEQDESC)
+        const SectionEntry *common_section = nullptr;
+        const SectionEntry *rotations_section = nullptr;
         const SectionEntry *traj_section = nullptr;
         const SectionEntry *seqdesc_section = nullptr;
         for (auto &s : sections)
         {
-            if (s.id == SECTION_GENINSTRUCTIONS)
-                geninst_section = &s;
+            if (s.id == SECTION_COMMON)
+                common_section = &s;
+            if (s.id == SECTION_ROTATIONS)
+                rotations_section = &s;
             if (s.id == SECTION_TRAJECTORY)
                 traj_section = &s;
             if (s.id == SECTION_SEQUENCEDESCRIPTION)
@@ -372,13 +401,20 @@ namespace mrdserver
         if (!traj_section)
             return cache; // no trajectory data
 
-        // Read rotation matrices, label_limits, definitions from GENINSTRUCTIONS
+        // Per-RF-def bandwidth and generic [DEFINITIONS] come from COMMON.
         std::map<int, float> rf_bandwidth_hz; // rf_def_id -> bandwidth_hz
-        if (geninst_section)
+        if (common_section)
         {
-            cache.rotations = read_rotations_from_geninstructions(
-                f, geninst_section->offset, geninst_section->size, do_swap,
+            read_metadata_from_common(
+                f, common_section->offset, common_section->size, do_swap,
                 cache, rf_bandwidth_hz);
+        }
+
+        // Rotation-matrix library comes from its own ROTATIONS section.
+        if (rotations_section)
+        {
+            cache.rotations = read_rotations_section(
+                f, rotations_section->offset, do_swap);
         }
 
         // Read trajectory section
