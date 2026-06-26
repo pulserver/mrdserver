@@ -85,12 +85,12 @@ namespace mrdserver
             return v;
         }
 
-        void skip_ints(std::ifstream &f, int count)
+        /*void skip_ints(std::ifstream &f, int count)
         {
             f.seekg(static_cast<std::streamoff>(count) * 4, std::ios::cur);
             if (!f.good())
                 throw std::runtime_error("unexpected EOF skipping ints");
-        }
+        }*/
 
         // ---------- read the DEFINITIONS section (section 0) ----------
 
