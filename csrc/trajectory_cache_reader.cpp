@@ -95,15 +95,17 @@ namespace mrdserver
 
         // ---------- read descriptor metadata from COMMON (section 1) ----------
 
-        // Walks the first subsequence's COMMON descriptor to extract the
-        // per-rf-def bandwidth_hz map (via out param) and the generic
-        // [DEFINITIONS] map (into cache.definitions). Rotation matrices, raw
-        // shapes and the scan table live in their own sections (ROTATIONS,
-        // SHAPES, SCANLOOP) and are NOT walked here.
+        // Walks ALL subsequences' COMMON descriptors to extract the per-rf-def
+        // bandwidth_hz map per subsequence (via out param, indexed by subseq) and
+        // the generic [DEFINITIONS] maps. Each subsequence's definitions are kept
+        // addressably in cache.subseq_definitions[s]; cache.definitions holds the
+        // concatenated merge across all subsequences. Rotation matrices, raw shapes
+        // and the scan table live in their own sections (ROTATIONS, SHAPES,
+        // SCANLOOP) and are NOT walked here.
         void read_metadata_from_common(
             std::ifstream &f, long section_offset, int section_size, bool do_swap,
             SequenceCache &cache,
-            std::map<int, float> &out_rf_bandwidth_hz)
+            std::vector<std::map<int, float>> &out_rf_bandwidth_hz)
         {
             f.seekg(section_offset, std::ios::beg);
             if (!f.good())
@@ -121,7 +123,9 @@ namespace mrdserver
             // interleave one info + one descriptor per loop iteration.
             skip_ints(f, num_subseq * 4);
 
-            // We only need the first subsequence's metadata for now.
+            cache.subseq_definitions.assign(static_cast<size_t>(num_subseq), {});
+            out_rf_bandwidth_hz.assign(static_cast<size_t>(num_subseq), {});
+
             for (int s = 0; s < num_subseq; ++s)
             {
                 // --- Descriptor scalars: 11 ints + 12 floats ---
@@ -150,7 +154,7 @@ namespace mrdserver
                     skip_ints(f, 8);                      // stats 0-7: flip..isodelay_us
                     float bw = read_float(f, do_swap);    // stat 8: bandwidth_hz
                     skip_ints(f, RF_DEF_FIELDS_PER - 15); // remaining stats + bands + vendor
-                    out_rf_bandwidth_hz[rf_id] = bw;
+                    out_rf_bandwidth_hz[s][rf_id] = bw;
                 }
 
                 // --- RF table ---
@@ -264,6 +268,7 @@ namespace mrdserver
 
                 // --- Generic definitions ---
                 {
+                    std::map<std::string, std::vector<std::string>> defs;
                     int num_defs = read_int(f, do_swap);
                     for (int d = 0; d < num_defs; ++d)
                     {
@@ -284,14 +289,21 @@ namespace mrdserver
                             if (!f.good())
                                 throw std::runtime_error("EOF reading definition value");
                         }
-                        cache.definitions[std::move(name)] = std::move(values);
+                        defs[std::move(name)] = std::move(values);
+                    }
+
+                    // Keep this subsequence's definitions addressable per-subseq, and
+                    // merge into the global map by concatenation (a multi-contrast
+                    // collection lists all subsequences' values per key).
+                    cache.subseq_definitions[static_cast<size_t>(s)] = defs;
+                    for (const auto &kv : defs)
+                    {
+                        auto &g = cache.definitions[kv.first];
+                        g.insert(g.end(), kv.second.begin(), kv.second.end());
                     }
                 }
 
                 // --- Scan table: lives in the SCANLOOP section (not walked here) ---
-
-                // Only read first subsequence
-                break;
             }
         }
 
@@ -402,7 +414,7 @@ namespace mrdserver
             return cache; // no trajectory data
 
         // Per-RF-def bandwidth and generic [DEFINITIONS] come from COMMON.
-        std::map<int, float> rf_bandwidth_hz; // rf_def_id -> bandwidth_hz
+        std::vector<std::map<int, float>> rf_bandwidth_hz; // [subseq] -> (rf_def_id -> bandwidth_hz)
         if (common_section)
         {
             read_metadata_from_common(
@@ -597,11 +609,18 @@ namespace mrdserver
                             tup.rf_shim_id = key.rf_shim_id;
                             tup.ss_grad_amp_hz_per_m = key.ss_grad_amp;
 
-                            // Compute slice thickness if possible
+                            // Compute slice thickness if possible.
+                            // RF bandwidth is per-subsequence (rf_def_id is
+                            // subsequence-local); key by this subseq's index.
                             float bw = 0.0f;
-                            auto bw_it = rf_bandwidth_hz.find(key.rf_def_id);
-                            if (bw_it != rf_bandwidth_hz.end())
-                                bw = bw_it->second;
+                            int sidx = sd.subseq_idx;
+                            if (sidx >= 0 && sidx < static_cast<int>(rf_bandwidth_hz.size()))
+                            {
+                                const auto &bwmap = rf_bandwidth_hz[static_cast<size_t>(sidx)];
+                                auto bw_it = bwmap.find(key.rf_def_id);
+                                if (bw_it != bwmap.end())
+                                    bw = bw_it->second;
+                            }
 
                             if (key.ss_grad_amp > 0.0f && bw > 0.0f)
                             {
@@ -911,6 +930,19 @@ namespace mrdserver
             for (int es = 0; es < num_es; ++es)
             {
                 const auto &ces = cache.encoding_spaces[es];
+
+                // Resolve this encoding space's own subsequence definitions.
+                // Source for any field that is conceptually per-encoding-space.
+                // FOV/matrix below come from the TRAJECTORY per-ES fields and
+                // TR/TE/TI/FA live in the header-global sequenceParameters, so no
+                // definition-sourced per-ES field is applied here yet; this is the
+                // resolution hook for future per-ES, definition-derived values.
+                const int sidx = ces.subseq_idx;
+                const std::map<std::string, std::vector<std::string>> *defs = nullptr;
+                if (sidx >= 0 && sidx < static_cast<int>(cache.subseq_definitions.size()))
+                    defs = &cache.subseq_definitions[static_cast<size_t>(sidx)];
+                (void)defs;
+
                 ISMRMRD::EncodingSpace space;
                 space.matrixSize.x = static_cast<uint16_t>(ces.matrix[0]);
                 space.matrixSize.y = static_cast<uint16_t>(ces.matrix[1]);
