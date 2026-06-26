@@ -163,11 +163,9 @@ namespace mrdserver
         std::vector<std::array<float, 9>> rotations;
         std::vector<EncodingSpace> encoding_spaces;
         std::vector<TrajTableEntry> table;
+        // Concatenated merge of every subsequence's [DEFINITIONS] (duplicate keys
+        // across subsequences accumulate, e.g. one TR value per subsequence).
         std::map<std::string, std::vector<std::string>> definitions;
-        // Per-subsequence [DEFINITIONS] maps, indexed by subsequence index (0..num_subseqs-1).
-        // `definitions` (above) is the concatenated merge across all subsequences, retained for
-        // global consumers; per-encoding-space enrichment uses subseq_definitions[es.subseq_idx].
-        std::vector<std::map<std::string, std::vector<std::string>>> subseq_definitions;
         /* Section 6 — sequence description (populated when present) */
         std::vector<SequenceDescription> seq_descs;
         SequenceParameters seq_params;

@@ -97,11 +97,10 @@ namespace mrdserver
 
         // Walks ALL subsequences' COMMON descriptors to extract the per-rf-def
         // bandwidth_hz map per subsequence (via out param, indexed by subseq) and
-        // the generic [DEFINITIONS] maps. Each subsequence's definitions are kept
-        // addressably in cache.subseq_definitions[s]; cache.definitions holds the
-        // concatenated merge across all subsequences. Rotation matrices, raw shapes
-        // and the scan table live in their own sections (ROTATIONS, SHAPES,
-        // SCANLOOP) and are NOT walked here.
+        // the generic [DEFINITIONS] maps, concatenation-merged into cache.definitions
+        // (so e.g. each subsequence contributes its own TR/TE/TI/FlipAngle value).
+        // Rotation matrices, raw shapes and the scan table live in their own sections
+        // (ROTATIONS, SHAPES, SCANLOOP) and are NOT walked here.
         void read_metadata_from_common(
             std::ifstream &f, long section_offset, int section_size, bool do_swap,
             SequenceCache &cache,
@@ -123,7 +122,6 @@ namespace mrdserver
             // interleave one info + one descriptor per loop iteration.
             skip_ints(f, num_subseq * 4);
 
-            cache.subseq_definitions.assign(static_cast<size_t>(num_subseq), {});
             out_rf_bandwidth_hz.assign(static_cast<size_t>(num_subseq), {});
 
             for (int s = 0; s < num_subseq; ++s)
@@ -292,10 +290,10 @@ namespace mrdserver
                         defs[std::move(name)] = std::move(values);
                     }
 
-                    // Keep this subsequence's definitions addressable per-subseq, and
-                    // merge into the global map by concatenation (a multi-contrast
-                    // collection lists all subsequences' values per key).
-                    cache.subseq_definitions[static_cast<size_t>(s)] = defs;
+                    // Merge into the global map by concatenation: a multi-contrast
+                    // collection accumulates every subsequence's value per key (e.g.
+                    // one TR/TE/TI/FlipAngle per subsequence), reduced to a single
+                    // representative in enrich_ismrmrd_header.
                     for (const auto &kv : defs)
                     {
                         auto &g = cache.definitions[kv.first];
@@ -889,10 +887,27 @@ namespace mrdserver
                 }
                 return out;
             };
-            auto tr = get_floats("TR");
-            auto te = get_floats("TE");
-            auto ti = get_floats("TI");
-            auto fa = get_floats("FlipAngle");
+            // Sequence parameters are NOT divided per encoding space in the ISMRMRD
+            // header; for a multi-subsequence (multi-contrast) collection the merged
+            // values are reduced to a single representative — min TR/TE/TI, max
+            // flip angle. (Per-subsequence detail is carried separately by the
+            // SEQDESC waveforms.) Each is emitted as a one-element vector.
+            auto reduce_min = [](std::vector<float> vals) -> std::vector<float>
+            {
+                if (vals.empty())
+                    return {};
+                return {*std::min_element(vals.begin(), vals.end())};
+            };
+            auto reduce_max = [](std::vector<float> vals) -> std::vector<float>
+            {
+                if (vals.empty())
+                    return {};
+                return {*std::max_element(vals.begin(), vals.end())};
+            };
+            auto tr = reduce_min(get_floats("TR"));
+            auto te = reduce_min(get_floats("TE"));
+            auto ti = reduce_min(get_floats("TI"));
+            auto fa = reduce_max(get_floats("FlipAngle"));
             if (!tr.empty())
                 seqp.TR = tr;
             if (!te.empty())
@@ -931,18 +946,11 @@ namespace mrdserver
             {
                 const auto &ces = cache.encoding_spaces[es];
 
-                // Resolve this encoding space's own subsequence definitions.
-                // Source for any field that is conceptually per-encoding-space.
-                // FOV/matrix below come from the TRAJECTORY per-ES fields and
-                // TR/TE/TI/FA live in the header-global sequenceParameters, so no
-                // definition-sourced per-ES field is applied here yet; this is the
-                // resolution hook for future per-ES, definition-derived values.
-                const int sidx = ces.subseq_idx;
-                const std::map<std::string, std::vector<std::string>> *defs = nullptr;
-                if (sidx >= 0 && sidx < static_cast<int>(cache.subseq_definitions.size()))
-                    defs = &cache.subseq_definitions[static_cast<size_t>(sidx)];
-                (void)defs;
-
+                // FOV/matrix are per-encoding-space and already definition-sourced:
+                // the writer copies each subsequence's [DEFINITIONS] FOV/Matrix (and
+                // NavFOV/NavMatrix for the navigator ES) into the TRAJECTORY per-ES
+                // fov/matrix fields read into ces, with the N/N+1 split for PMC
+                // navigators handled there. So ces.fov/ces.matrix are authoritative.
                 ISMRMRD::EncodingSpace space;
                 space.matrixSize.x = static_cast<uint16_t>(ces.matrix[0]);
                 space.matrixSize.y = static_cast<uint16_t>(ces.matrix[1]);
