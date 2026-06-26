@@ -3,10 +3,17 @@
  * @brief Standalone reader for pulseqlib binary cache trajectory data.
  *
  * No dependency on pulserverlib — reads the binary cache format directly.
- * Reads section 1 (COMMON) for per-RF-definition bandwidth and the generic
- * [DEFINITIONS] map, section 2 (ROTATIONS) for the rotation-matrix library,
- * section 6 (TRAJECTORY) for the kshot library, encoding spaces, and table,
- * and section 7 (SEQDESC) when present.
+ * Stage 1.5c/1.5d: the reader is now self-contained across three sections
+ * only, and never walks the PSD-internal COMMON/ROTATIONS descriptor:
+ *   - Section 0 (DEFINITIONS): per-subsequence generic [DEFINITIONS] kv
+ *     (FOV/Matrix/NavFOV/NavMatrix/TR/TE/TI/FlipAngle/... as pulseq strings).
+ *   - Section 6 (TRAJECTORY): kshot library, encoding spaces (geometry now
+ *     sourced from DEFINITIONS by subseq_idx, not duplicated here), table,
+ *     and a folded-in rotation-matrix library (table[].rotation_id indexes
+ *     it directly; no separate ROTATIONS-section read).
+ *   - Section 7 (SEQDESC): per-subsequence event lists + a per-subsequence
+ *     RF-definition library (bandwidth/bands/b1sq + compressed mag/phase/
+ *     time shapes), when present.
  *
  * Section 5 (FREQMOD / off-isocenter shift) is intentionally NOT parsed:
  * frequency modulation is applied PSD-side, so data arriving at the
@@ -41,12 +48,13 @@ namespace mrdserver
 
     struct EncodingSpace
     {
-        float fov[3];
-        float matrix[3];
-        float nav_fov[3];
-        float nav_matrix[3];
+        /* Stage 1.5c: fov/matrix/nav_fov/nav_matrix dropped -- geometry is
+         * sourced from SequenceCache::definitions_by_subseq[subseq_idx] by
+         * key ("FOV"/"Matrix" when geometry_tag==0, "NavFOV"/"NavMatrix"
+         * when geometry_tag==1), not duplicated here. */
         int subseq_idx;
         int nav_subseq_offset;
+        int geometry_tag; /**< 0 = primary, 1 = navigator */
         struct
         {
             LabelLimit slc, phs, rep, avg, seg, set, eco, par, lin, acq;
@@ -124,7 +132,9 @@ namespace mrdserver
         float adc_phase_offset_rad() const { return params[1]; }
     };
 
-    /** @brief RF shape tuple: unique (rf_def_id, rf_shim_id, ss_grad_amp) triplet. */
+    /** @brief RF shape tuple: unique (rf_def_id, rf_shim_id, ss_grad_amp) triplet,
+     * deduped over a subsequence's events. Carries the per-event slice-geometry
+     * derivation (bandwidth_hz comes from the matching RfDef, Stage 1.5d). */
     struct RfShapeTuple
     {
         int tuple_id;
@@ -135,12 +145,39 @@ namespace mrdserver
         int slice_selective;        /**< 1 if slice_thickness_mm < 10 mm, else 0 */
     };
 
-    /** @brief Per-subsequence sequence description (event list + RF tuple library). */
+    /** @brief One (still-compressed) RF waveform shape, copied verbatim from
+     * SEQDESC. Gadgetron decompresses; the reader never does. */
+    struct RfShapeSamples
+    {
+        int num_uncompressed = 0;
+        std::vector<float> samples; /**< compressed (delta-RLE), as stored */
+    };
+
+    /** @brief Per-subsequence RF-definition library entry (Stage 1.5b/1.5d).
+     * rf_def_id is the array index into this subsequence's library, matching
+     * SeqEvent::rf_def_id() for RF rows. */
+    struct RfDef
+    {
+        int rf_def_id = 0;
+        float bandwidth_hz = 0.0f;
+        int num_bands = 1;
+        float band_freq_offsets_hz[8] = {0};
+        float band_bandwidth_hz = 0.0f;
+        float total_b1sq_power = 0.0f;
+        RfShapeSamples mag;
+        bool has_phase = false;
+        RfShapeSamples phase;
+        bool has_time = false;
+        RfShapeSamples time;
+    };
+
+    /** @brief Per-subsequence sequence description (event list + RF libraries). */
     struct SequenceDescription
     {
         int subseq_idx = 0;
         float tr_duration_us = 0.0f;
-        std::vector<RfShapeTuple> rf_shape_tuples; /**< deduped RF triplets */
+        std::vector<RfDef> rf_defs;                 /**< per-rf_def_id library (Stage 1.5b) */
+        std::vector<RfShapeTuple> rf_shape_tuples; /**< deduped (def,shim,ss_grad) triplets */
         std::vector<SeqEvent> events;              /**< TR events (RF/ADC/WAIT) */
     };
 
@@ -166,6 +203,10 @@ namespace mrdserver
         // Concatenated merge of every subsequence's [DEFINITIONS] (duplicate keys
         // across subsequences accumulate, e.g. one TR value per subsequence).
         std::map<std::string, std::vector<std::string>> definitions;
+        /* Per-subsequence [DEFINITIONS] kv, indexed by subseq_idx (Stage 1.5a/1.5d).
+         * Source of per-encoding-space FOV/Matrix/NavFOV/NavMatrix geometry --
+         * see EncodingSpace doc comment. */
+        std::vector<std::map<std::string, std::vector<std::string>>> definitions_by_subseq;
         /* Section 6 — sequence description (populated when present) */
         std::vector<SequenceDescription> seq_descs;
         SequenceParameters seq_params;
@@ -380,14 +421,18 @@ namespace mrdserver
         uint32_t scan_counter);
 
     /**
-     * @brief Create the RF-shape-tuple waveform (ID 1002) for one subsequence.
+     * @brief Create the RF-shape waveform (ID 1002) for one subsequence.
      *
-     * Packs the flattened mag/phase/time arrays for all tuples.
-     * Header per tuple (as uint32 words):
-     *   tuple_id, N_tx, N_samples, rf_raster_us (float), num_bands,
-     *   band_freq_offsets_hz[8], band_bandwidth_hz, total_b1sq_power,
-     *   has_phase, has_time
-     * Followed by the waveform samples.
+     * Stage 1.5d: packs the REAL (still-compressed) mag/phase/time sample
+     * arrays for every entry in desc.rf_defs (Gadgetron decompresses).
+     * Header per rf_def (as uint32 words):
+     *   rf_def_id, bandwidth_hz (float), num_bands,
+     *   band_freq_offsets_hz[8] (float x8), band_bandwidth_hz (float),
+     *   total_b1sq_power (float), mag_num_uncompressed, mag_num_samples,
+     *   has_phase, [if has_phase: phase_num_uncompressed, phase_num_samples],
+     *   has_time, [if has_time: time_num_uncompressed, time_num_samples]
+     * Followed by: mag samples, then phase samples (if any), then time
+     * samples (if any) -- all as float32 bit-cast into the uint32 payload.
      */
     ISMRMRD::Waveform make_seqdesc_rf_shapes_waveform(
         const SequenceDescription &desc,

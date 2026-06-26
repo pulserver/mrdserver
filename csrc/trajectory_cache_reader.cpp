@@ -2,11 +2,13 @@
  * @file trajectory_cache_reader.cpp
  * @brief Standalone reader for pulseqlib binary cache.
  *
- * Reads sections from the cache:
- *   - Section 1 (COMMON): per-RF-definition bandwidth + generic [DEFINITIONS]
- *   - Section 2 (ROTATIONS): rotation-matrix library
- *   - Section 6 (TRAJECTORY): kshot library, encoding spaces, table
- *   - Section 7 (SEQDESC): event lists, RF shapes, shims (optional)
+ * Reads sections from the cache (Stage 1.5c/1.5d -- self-contained, no
+ * PSD-internal COMMON/ROTATIONS descriptor walk):
+ *   - Section 0 (DEFINITIONS): per-subsequence generic [DEFINITIONS] kv
+ *   - Section 6 (TRAJECTORY): kshot library, encoding spaces, table, and a
+ *     folded-in rotation-matrix library
+ *   - Section 7 (SEQDESC): event lists, per-subsequence RF-def library
+ *     (bandwidth/bands/b1sq + compressed shapes) (optional)
  *
  * Section 5 (FREQMOD) is intentionally NOT parsed; off-isocenter shifts are
  * applied PSD-side and data arriving at the recon are already centered.
@@ -34,13 +36,10 @@ namespace mrdserver
 
     namespace
     {
-
         constexpr int32_t CACHE_ENDIAN_MARKER = 0x01020304;
-        constexpr int SECTION_COMMON = 1;
-        constexpr int SECTION_ROTATIONS = 2;
+        constexpr int SECTION_DEFINITIONS = 0;
         constexpr int SECTION_TRAJECTORY = 6;
         constexpr int SECTION_SEQUENCEDESCRIPTION = 7;
-        constexpr int MAX_GRAD_SHOTS = 16;
         constexpr int MAX_BANDS = 8;
 
         // ---------- byte-swap helpers ----------
@@ -93,247 +92,53 @@ namespace mrdserver
                 throw std::runtime_error("unexpected EOF skipping ints");
         }
 
-        // ---------- read descriptor metadata from COMMON (section 1) ----------
+        // ---------- read the DEFINITIONS section (section 0) ----------
 
-        // Walks ALL subsequences' COMMON descriptors to extract the per-rf-def
-        // bandwidth_hz map per subsequence (via out param, indexed by subseq) and
-        // the generic [DEFINITIONS] maps, concatenation-merged into cache.definitions
-        // (so e.g. each subsequence contributes its own TR/TE/TI/FlipAngle value).
-        // Rotation matrices, raw shapes and the scan table live in their own sections
-        // (ROTATIONS, SHAPES, SCANLOOP) and are NOT walked here.
-        void read_metadata_from_common(
-            std::ifstream &f, long section_offset, int section_size, bool do_swap,
-            SequenceCache &cache,
-            std::vector<std::map<int, float>> &out_rf_bandwidth_hz)
-        {
-            f.seekg(section_offset, std::ios::beg);
-            if (!f.good())
-                throw std::runtime_error("cannot seek to COMMON");
-            (void)section_size;
-
-            // First, skip the collection-level header (6 ints):
-            //   num_subsequences, num_repetitions, total_unique_segments,
-            //   total_unique_adcs, total_blocks, total_duration_us
-            int num_subseq = read_int(f, do_swap);
-            skip_ints(f, 5); // remaining collection header fields
-
-            // Subsequence-info entries (4 ints each) for ALL subseqs come BEFORE
-            // any descriptor, so we must skip the whole block at once — not
-            // interleave one info + one descriptor per loop iteration.
-            skip_ints(f, num_subseq * 4);
-
-            out_rf_bandwidth_hz.assign(static_cast<size_t>(num_subseq), {});
-
-            for (int s = 0; s < num_subseq; ++s)
-            {
-                // --- Descriptor scalars: 11 ints + 12 floats ---
-                skip_ints(f, 11); // num_prep_blocks..vendor
-                skip_ints(f, 12); // fov[3], matrix[3], nav_fov[3], nav_matrix[3]
-
-                // --- Block definitions ---
-                int num_unique_blocks = read_int(f, do_swap);
-                skip_ints(f, num_unique_blocks * 7);
-
-                // --- Block table ---
-                int num_blocks = read_int(f, do_swap);
-                skip_ints(f, num_blocks * 16);
-
-                // --- RF definitions ---
-                int num_unique_rfs = read_int(f, do_swap);
-                // Per rf_def layout (must match write_descriptor() in pulseqlib_cache.c):
-                //   6 scalars (id, mag/phase/time_shape_id, delay, num_channels)
-                // + 11 base stats (flip..num_samples)  — bandwidth_hz is the 9th stat (index 14 overall)
-                // + 1 num_bands + MAX_BANDS band_freq_offsets + 2 (band_bw, b1sq) + 1 vendor tag
-                constexpr int RF_DEF_FIELDS_PER = 6 + 11 + 1 + MAX_BANDS + 2 + 1;
-                for (int ri = 0; ri < num_unique_rfs; ++ri)
-                {
-                    int rf_id = read_int(f, do_swap);     // field 0: id
-                    skip_ints(f, 5);                      // fields 1-5: shape ids, delay, num_channels
-                    skip_ints(f, 8);                      // stats 0-7: flip..isodelay_us
-                    float bw = read_float(f, do_swap);    // stat 8: bandwidth_hz
-                    skip_ints(f, RF_DEF_FIELDS_PER - 15); // remaining stats + bands + vendor
-                    out_rf_bandwidth_hz[s][rf_id] = bw;
-                }
-
-                // --- RF table ---
-                int rf_table_size = read_int(f, do_swap);
-                // per row: id(i), amplitude(f), freq_offset(f), phase_offset(f), rf_use(i) = 5 fields
-                skip_ints(f, rf_table_size * 5);
-
-                // --- Grad definitions ---
-                int num_unique_grads = read_int(f, do_swap);
-                // per grad_def: 8 + MAX_GRAD_SHOTS + 6*MAX_GRAD_SHOTS = 120 fields
-                skip_ints(f, num_unique_grads * (8 + 7 * MAX_GRAD_SHOTS));
-
-                // --- Grad table ---
-                int grad_table_size = read_int(f, do_swap);
-                skip_ints(f, grad_table_size * 3); // id, shot_index, amplitude
-
-                // --- ADC definitions ---
-                int num_unique_adcs = read_int(f, do_swap);
-                skip_ints(f, num_unique_adcs * 4);
-
-                // --- ADC table ---
-                int adc_table_size = read_int(f, do_swap);
-                skip_ints(f, adc_table_size * 3);
-
-                // --- Freq-mod definitions (legacy, count=0 expected) ---
-                int num_fmod = read_int(f, do_swap);
-                // each: id, num_samples, raster_us, duration_us, then waveform arrays + ref_integral + ref_time
-                // For the cache, freq_mod_defs are written as count=0, so skip nothing
-                if (num_fmod > 0)
-                {
-                    throw std::runtime_error("non-zero freq_mod_definitions in cache not supported");
-                }
-
-                // --- RF shim definitions ---
-                int num_shims = read_int(f, do_swap);
-                for (int sh = 0; sh < num_shims; ++sh)
-                {
-                    skip_ints(f, 1); // id
-                    int nch = read_int(f, do_swap);
-                    skip_ints(f, nch * 2); // magnitudes[nch] + phases[nch]
-                }
-
-                // --- Rotations: live in the ROTATIONS section (read separately) ---
-
-                // --- Triggers ---
-                int num_triggers = read_int(f, do_swap);
-                skip_ints(f, num_triggers * 5);
-
-                // --- Shapes: live in the SHAPES section (not walked here) ---
-
-                // --- TR descriptor (10 fields) ---
-                skip_ints(f, 10);
-
-                // --- Segment definitions (must match write_descriptor() in
-                //     pulseqlib_cache.c) ---
-                {
-                    int num_segs_def = read_int(f, do_swap);
-                    for (int sg = 0; sg < num_segs_def; ++sg)
-                    {
-                        skip_ints(f, 1); // start_block
-                        int seg_nblocks = read_int(f, do_swap);
-                        skip_ints(f, 1); // max_energy_start_block
-                        if (seg_nblocks > 0)
-                            skip_ints(f, seg_nblocks * 7); // 7 arrays × num_blocks:
-                                                           // unique_block_indices + has_digitalout
-                                                           // + has_rotation + norot + nopos
-                                                           // + has_freq_mod + has_adc
-                        skip_ints(f, 2);                   // trigger_id, is_nav
-                        // Segment timing anchors (cache v1.7+): num_rf_anchors,
-                        // rf_anchors (6 words each), num_adc_anchors, adc_anchors
-                        // (5 words each). See pulseqlib_segment_{rf,adc}_anchor.
-                        int seg_num_rf = read_int(f, do_swap);
-                        if (seg_num_rf > 0)
-                            skip_ints(f, seg_num_rf * 6);
-                        int seg_num_adc = read_int(f, do_swap);
-                        if (seg_num_adc > 0)
-                            skip_ints(f, seg_num_adc * 5);
-                    }
-                }
-
-                // --- Segment table ---
-                {
-                    skip_ints(f, 1); // num_unique_segments (redundant)
-                    int n_prep = read_int(f, do_swap);
-                    if (n_prep > 0)
-                        skip_ints(f, n_prep);
-                    int n_main = read_int(f, do_swap);
-                    if (n_main > 0)
-                        skip_ints(f, n_main);
-                    int n_cool = read_int(f, do_swap);
-                    if (n_cool > 0)
-                        skip_ints(f, n_cool);
-                }
-
-                // --- Label table (skip: written with fwrite, same 4-byte fields) ---
-                {
-                    int label_cols = read_int(f, do_swap);
-                    int label_rows = read_int(f, do_swap);
-                    if (label_rows > 0 && label_cols > 0)
-                        skip_ints(f, label_rows * label_cols);
-                }
-
-                // --- Label limits (global, kept for backward compatibility but superseded by per-ES limits) ---
-                {
-                    LabelLimit ll[10];
-                    if (!read4(f, ll, 20))
-                        throw std::runtime_error("EOF reading label_limits");
-                    // Consumed but not stored — per-encoding-space limits in TRAJECTORY section take precedence.
-                    (void)ll;
-                }
-
-                // --- Generic definitions ---
-                {
-                    std::map<std::string, std::vector<std::string>> defs;
-                    int num_defs = read_int(f, do_swap);
-                    for (int d = 0; d < num_defs; ++d)
-                    {
-                        // name: length-prefixed string (not null-terminated in file)
-                        int name_len = read_int(f, do_swap);
-                        std::string name(static_cast<size_t>(name_len), '\0');
-                        f.read(&name[0], name_len);
-                        if (!f.good())
-                            throw std::runtime_error("EOF reading definition name");
-
-                        int value_size = read_int(f, do_swap);
-                        std::vector<std::string> values(static_cast<size_t>(value_size));
-                        for (int v = 0; v < value_size; ++v)
-                        {
-                            int vlen = read_int(f, do_swap);
-                            values[v].resize(static_cast<size_t>(vlen));
-                            f.read(&values[v][0], vlen);
-                            if (!f.good())
-                                throw std::runtime_error("EOF reading definition value");
-                        }
-                        defs[std::move(name)] = std::move(values);
-                    }
-
-                    // Merge into the global map by concatenation: a multi-contrast
-                    // collection accumulates every subsequence's value per key (e.g.
-                    // one TR/TE/TI/FlipAngle per subsequence), reduced to a single
-                    // representative in enrich_ismrmrd_header.
-                    for (const auto &kv : defs)
-                    {
-                        auto &g = cache.definitions[kv.first];
-                        g.insert(g.end(), kv.second.begin(), kv.second.end());
-                    }
-                }
-
-                // --- Scan table: lives in the SCANLOOP section (not walked here) ---
-            }
-        }
-
-        // ---------- read the ROTATIONS section (section 2) ----------
-
-        // Augment-section layout: [num_subsequences][per descriptor:
-        // num_rotations + num_rotations*9 floats]. We keep the first
-        // subsequence's matrices (matches the previous behaviour).
-        std::vector<std::array<float, 9>> read_rotations_section(
+        // Augment-section layout: [num_subsequences][per subseq: num_definitions,
+        // then name/value kv pairs -- see write_definitions() in pulseqlib_cache.c].
+        // Returns one kv map per subsequence (index == subseq_idx); FOV/Matrix/
+        // NavFOV/NavMatrix are present verbatim as pulseq string entries.
+        std::vector<std::map<std::string, std::vector<std::string>>> read_definitions_section(
             std::ifstream &f, long section_offset, bool do_swap)
         {
-            std::vector<std::array<float, 9>> rotations;
+            std::vector<std::map<std::string, std::vector<std::string>>> result;
 
             f.seekg(section_offset, std::ios::beg);
             if (!f.good())
-                throw std::runtime_error("cannot seek to ROTATIONS");
+                throw std::runtime_error("cannot seek to DEFINITIONS");
 
             int num_subseq = read_int(f, do_swap);
             if (num_subseq <= 0)
-                return rotations;
+                return result;
+            result.resize(static_cast<size_t>(num_subseq));
 
-            int num_rotations = read_int(f, do_swap);
-            rotations.resize(static_cast<size_t>(num_rotations));
-            for (int r = 0; r < num_rotations; ++r)
+            for (int s = 0; s < num_subseq; ++s)
             {
-                if (!read4(f, rotations[r].data(), 9))
-                    throw std::runtime_error("EOF reading rotations");
-                if (do_swap)
-                    swap4_array(rotations[r].data(), 9);
+                auto &defs = result[static_cast<size_t>(s)];
+                int num_defs = read_int(f, do_swap);
+                for (int d = 0; d < num_defs; ++d)
+                {
+                    int name_len = read_int(f, do_swap);
+                    std::string name(static_cast<size_t>(name_len), '\0');
+                    f.read(&name[0], name_len);
+                    if (!f.good())
+                        throw std::runtime_error("EOF reading definition name");
+
+                    int value_size = read_int(f, do_swap);
+                    std::vector<std::string> values(static_cast<size_t>(value_size));
+                    for (int v = 0; v < value_size; ++v)
+                    {
+                        int vlen = read_int(f, do_swap);
+                        values[v].resize(static_cast<size_t>(vlen));
+                        f.read(&values[v][0], vlen);
+                        if (!f.good())
+                            throw std::runtime_error("EOF reading definition value");
+                    }
+                    defs[std::move(name)] = std::move(values);
+                }
             }
 
-            return rotations;
+            return result;
         }
 
     } // anonymous namespace
@@ -391,17 +196,14 @@ namespace mrdserver
             sections[i].size = read_int(f, do_swap);
         }
 
-        // Find sections 1 (COMMON), 2 (ROTATIONS), 6 (TRAJECTORY), 7 (SEQDESC)
-        const SectionEntry *common_section = nullptr;
-        const SectionEntry *rotations_section = nullptr;
+        // Find sections 0 (DEFINITIONS), 6 (TRAJECTORY), 7 (SEQDESC)
+        const SectionEntry *definitions_section = nullptr;
         const SectionEntry *traj_section = nullptr;
         const SectionEntry *seqdesc_section = nullptr;
         for (auto &s : sections)
         {
-            if (s.id == SECTION_COMMON)
-                common_section = &s;
-            if (s.id == SECTION_ROTATIONS)
-                rotations_section = &s;
+            if (s.id == SECTION_DEFINITIONS)
+                definitions_section = &s;
             if (s.id == SECTION_TRAJECTORY)
                 traj_section = &s;
             if (s.id == SECTION_SEQUENCEDESCRIPTION)
@@ -411,20 +213,22 @@ namespace mrdserver
         if (!traj_section)
             return cache; // no trajectory data
 
-        // Per-RF-def bandwidth and generic [DEFINITIONS] come from COMMON.
-        std::vector<std::map<int, float>> rf_bandwidth_hz; // [subseq] -> (rf_def_id -> bandwidth_hz)
-        if (common_section)
+        // Per-subsequence [DEFINITIONS] kv (FOV/Matrix/NavFOV/NavMatrix/TR/TE/
+        // TI/FlipAngle/... as pulseq strings) -- self-contained, no COMMON walk.
+        if (definitions_section)
         {
-            read_metadata_from_common(
-                f, common_section->offset, common_section->size, do_swap,
-                cache, rf_bandwidth_hz);
-        }
-
-        // Rotation-matrix library comes from its own ROTATIONS section.
-        if (rotations_section)
-        {
-            cache.rotations = read_rotations_section(
-                f, rotations_section->offset, do_swap);
+            cache.definitions_by_subseq = read_definitions_section(
+                f, definitions_section->offset, do_swap);
+            // Also merge-concatenate into the flat map for the scan-global
+            // TR/TE/TI/FlipAngle reduction in enrich_ismrmrd_header.
+            for (const auto &defs : cache.definitions_by_subseq)
+            {
+                for (const auto &kv : defs)
+                {
+                    auto &g = cache.definitions[kv.first];
+                    g.insert(g.end(), kv.second.begin(), kv.second.end());
+                }
+            }
         }
 
         // Read trajectory section
@@ -454,16 +258,9 @@ namespace mrdserver
         for (int i = 0; i < num_es; ++i)
         {
             auto &es = cache.encoding_spaces[i];
-            if (!read4(f, es.fov, 3))
-                throw std::runtime_error("EOF reading encoding space");
-            if (!read4(f, es.matrix, 3))
-                throw std::runtime_error("EOF reading encoding space");
-            if (!read4(f, es.nav_fov, 3))
-                throw std::runtime_error("EOF reading encoding space");
-            if (!read4(f, es.nav_matrix, 3))
-                throw std::runtime_error("EOF reading encoding space");
             es.subseq_idx = read_int(f, do_swap);
             es.nav_subseq_offset = read_int(f, do_swap);
+            es.geometry_tag = read_int(f, do_swap);
             // Per-encoding-space label limits (10 × {min,max} = 20 ints)
             {
                 LabelLimit ll[10];
@@ -481,13 +278,6 @@ namespace mrdserver
                 es.label_limits.par = ll[7];
                 es.label_limits.lin = ll[8];
                 es.label_limits.acq = ll[9];
-            }
-            if (do_swap)
-            {
-                swap4_array(es.fov, 3);
-                swap4_array(es.matrix, 3);
-                swap4_array(es.nav_fov, 3);
-                swap4_array(es.nav_matrix, 3);
             }
         }
 
@@ -526,7 +316,21 @@ namespace mrdserver
             e.off = read_int(f, do_swap);
         }
 
-        // Read Section 5 — sequence description (optional; graceful skip if absent)
+        // Stage 1.5c: rotation-matrix library, folded into TRAJECTORY itself
+        // (table[].rotation_id indexes this directly -- no ROTATIONS-section read).
+        {
+            int num_rotations = read_int(f, do_swap);
+            cache.rotations.resize(static_cast<size_t>(num_rotations));
+            for (int r = 0; r < num_rotations; ++r)
+            {
+                if (!read4(f, cache.rotations[static_cast<size_t>(r)].data(), 9))
+                    throw std::runtime_error("EOF reading folded-in rotation library");
+                if (do_swap)
+                    swap4_array(cache.rotations[static_cast<size_t>(r)].data(), 9);
+            }
+        }
+
+        // Read Section 7 (SEQDESC) — sequence description (optional; graceful skip if absent)
         if (seqdesc_section)
         {
             f.seekg(seqdesc_section->offset, std::ios::beg);
@@ -564,6 +368,52 @@ namespace mrdserver
                             ev.timestamp_us = read_float(f, do_swap);
                             for (int p = 0; p < 7; ++p)
                                 ev.params[p] = read_float(f, do_swap);
+                        }
+
+                        // Per-subsequence RF-definition library (Stage 1.5b/1.5d):
+                        // num_rf_defs, then per def: rf_def_id, bandwidth_hz,
+                        // num_bands, band_freq_offsets_hz[8], band_bandwidth_hz,
+                        // total_b1sq, mag shape {num_uncompressed,num_samples,
+                        // samples[]}, has_phase[+phase shape], has_time[+time shape].
+                        // See sd_write_rf_def_library() in pulseqlib_cache_seqdesc.c.
+                        {
+                            auto read_shape = [&](RfShapeSamples &shape)
+                            {
+                                shape.num_uncompressed = read_int(f, do_swap);
+                                int ns = read_int(f, do_swap);
+                                shape.samples.resize(static_cast<size_t>(ns));
+                                if (ns > 0)
+                                {
+                                    if (!read4(f, shape.samples.data(), ns))
+                                        throw std::runtime_error("EOF reading RF shape samples");
+                                    if (do_swap)
+                                        swap4_array(shape.samples.data(), ns);
+                                }
+                            };
+
+                            int num_rf_defs = read_int(f, do_swap);
+                            sd.rf_defs.resize(static_cast<size_t>(num_rf_defs));
+                            for (int rd = 0; rd < num_rf_defs; ++rd)
+                            {
+                                auto &def = sd.rf_defs[static_cast<size_t>(rd)];
+                                def.rf_def_id = read_int(f, do_swap);
+                                def.bandwidth_hz = read_float(f, do_swap);
+                                def.num_bands = read_int(f, do_swap);
+                                for (int b = 0; b < MAX_BANDS; ++b)
+                                    def.band_freq_offsets_hz[b] = read_float(f, do_swap);
+                                def.band_bandwidth_hz = read_float(f, do_swap);
+                                def.total_b1sq_power = read_float(f, do_swap);
+
+                                read_shape(def.mag);
+
+                                def.has_phase = read_int(f, do_swap) != 0;
+                                if (def.has_phase)
+                                    read_shape(def.phase);
+
+                                def.has_time = read_int(f, do_swap) != 0;
+                                if (def.has_time)
+                                    read_shape(def.time);
+                            }
                         }
 
                         // Build RF shape tuples by deduplicating
@@ -607,17 +457,15 @@ namespace mrdserver
                             tup.rf_shim_id = key.rf_shim_id;
                             tup.ss_grad_amp_hz_per_m = key.ss_grad_amp;
 
-                            // Compute slice thickness if possible.
-                            // RF bandwidth is per-subsequence (rf_def_id is
-                            // subsequence-local); key by this subseq's index.
+                            // Compute slice thickness if possible. bandwidth_hz
+                            // now comes from this subsequence's own RF-def
+                            // library (Stage 1.5d) -- rf_def_id indexes it
+                            // directly (array index == id, see sd_write_rf_def_library).
                             float bw = 0.0f;
-                            int sidx = sd.subseq_idx;
-                            if (sidx >= 0 && sidx < static_cast<int>(rf_bandwidth_hz.size()))
+                            if (key.rf_def_id >= 0 &&
+                                key.rf_def_id < static_cast<int>(sd.rf_defs.size()))
                             {
-                                const auto &bwmap = rf_bandwidth_hz[static_cast<size_t>(sidx)];
-                                auto bw_it = bwmap.find(key.rf_def_id);
-                                if (bw_it != bwmap.end())
-                                    bw = bw_it->second;
+                                bw = sd.rf_defs[static_cast<size_t>(key.rf_def_id)].bandwidth_hz;
                             }
 
                             if (key.ss_grad_amp > 0.0f && bw > 0.0f)
@@ -676,17 +524,13 @@ namespace mrdserver
             else if (first.kz_shot_id >= 0 && first.kz_shot_id < static_cast<int>(cache.kshots.size()))
                 nsamples = static_cast<int>(cache.kshots[first.kz_shot_id].k.size());
 
-            // If no kshot data but rotation is present, synthesise a unit radial line along kx.
-            // The rotation matrix for each readout will orient the spoke to its actual direction.
-            bool synthetic_radial = false;
+            // Stage 1.5c: the synthetic-radial fallback is gone. The radial
+            // classifier in compute_block_kspace (pulseqlib_trajectory.c) now
+            // stores a REAL base shot for every active, rotated axis instead
+            // of collapsing it to cartesian (-1), so nsamples == 0 here means
+            // there is genuinely no trajectory data for this encoding space.
             if (nsamples == 0)
-            {
-                if (es < static_cast<int>(cache.encoding_spaces.size()))
-                    nsamples = static_cast<int>(cache.encoding_spaces[es].matrix[0]);
-                if (nsamples == 0 || first.rotation_id < 0)
-                    continue;
-                synthetic_radial = true;
-            }
+                continue;
 
             const int num_ro = static_cast<int>(adc_indices.size());
             std::vector<float> kx_all(static_cast<size_t>(nsamples) * num_ro, 0.0f);
@@ -700,37 +544,26 @@ namespace mrdserver
                 float *py = &ky_all[static_cast<size_t>(r) * nsamples];
                 float *pz = &kz_all[static_cast<size_t>(r) * nsamples];
 
-                if (synthetic_radial)
+                /* kshot already holds the full-amplitude k-space waveform
+                 * in 1/m (compute_block_kspace integrates g_amp*shape*dt).
+                 * Do NOT multiply by entry.g*_amplitude again — that would
+                 * scale by the gradient amplitude a second time and yield
+                 * ~10^4× too-large k-values for noncartesian fixtures. The
+                 * amplitude field is retained in the table only as a
+                 * trivial-shot indicator.
+                 */
+                auto compose = [&](int shot_id, float *dst)
                 {
-                    // Unit line: [-0.5, 0.5] centred on center_sample, normalised by nsamples
-                    const float center = static_cast<float>(entry.center_sample);
-                    const float norm = static_cast<float>(nsamples);
-                    for (int i = 0; i < nsamples; ++i)
-                        px[i] = (static_cast<float>(i) - center) / norm;
-                    // ky, kz remain zero — rotation will spread kx into the spoke direction
-                }
-                else
-                {
-                    /* kshot already holds the full-amplitude k-space waveform
-                     * in 1/m (compute_block_kspace integrates g_amp*shape*dt).
-                     * Do NOT multiply by entry.g*_amplitude again — that would
-                     * scale by the gradient amplitude a second time and yield
-                     * ~10^4× too-large k-values for noncartesian fixtures. The
-                     * amplitude field is retained in the table only as a
-                     * trivial-shot indicator. */
-                    auto compose = [&](int shot_id, float *dst)
+                    if (shot_id >= 0 && shot_id < static_cast<int>(cache.kshots.size()))
                     {
-                        if (shot_id >= 0 && shot_id < static_cast<int>(cache.kshots.size()))
-                        {
-                            const auto &sk = cache.kshots[shot_id].k;
-                            for (int i = 0; i < std::min(nsamples, static_cast<int>(sk.size())); ++i)
-                                dst[i] = sk[i];
-                        }
-                    };
-                    compose(entry.kx_shot_id, px);
-                    compose(entry.ky_shot_id, py);
-                    compose(entry.kz_shot_id, pz);
-                }
+                        const auto &sk = cache.kshots[shot_id].k;
+                        for (int i = 0; i < std::min(nsamples, static_cast<int>(sk.size())); ++i)
+                            dst[i] = sk[i];
+                    }
+                };
+                compose(entry.kx_shot_id, px);
+                compose(entry.ky_shot_id, py);
+                compose(entry.kz_shot_id, pz);
 
                 /* NOTE: per-ADC rotation (entry.rotation_id) is intentionally
                  * NOT applied here.  The cache stores k samples in the
@@ -738,7 +571,8 @@ namespace mrdserver
                  * base_rot) is composed downstream by livesdk when building
                  * the full physical trajectory.  Applying rotation here would
                  * make this routine's output disagree with the LOGICAL-frame
-                 * truth produced by TruthBuilder.exportTrajectory. */
+                 * truth produced by TruthBuilder.exportTrajectory.
+                 */
             }
 
             auto is_zero = [](const std::vector<float> &v)
@@ -941,23 +775,67 @@ namespace mrdserver
                 return lim;
             };
 
+            // Stage 1.5c: FOV/Matrix are no longer duplicated on EncodingSpace --
+            // read the verbatim pulseq [DEFINITIONS] strings for this ES's owning
+            // subsequence (FOV/Matrix for the primary ES, NavFOV/NavMatrix for a
+            // navigator ES, selected by geometry_tag). Pulseq FOV is in METERS
+            // (e.g. "FOV 0.22 0.22 0.005"); ISMRMRD fieldOfView_mm wants mm.
+            auto read_geometry = [&](int subseq_idx, int geometry_tag,
+                                     float fov_mm[3], float matrix[3])
+            {
+                fov_mm[0] = fov_mm[1] = fov_mm[2] = 0.0f;
+                matrix[0] = matrix[1] = matrix[2] = 0.0f;
+                if (subseq_idx < 0 ||
+                    subseq_idx >= static_cast<int>(cache.definitions_by_subseq.size()))
+                    return;
+                const auto &defs = cache.definitions_by_subseq[static_cast<size_t>(subseq_idx)];
+                const char *fov_key = (geometry_tag == 1) ? "NavFOV" : "FOV";
+                const char *matrix_key = (geometry_tag == 1) ? "NavMatrix" : "Matrix";
+                auto fov_it = defs.find(fov_key);
+                if (fov_it != defs.end() && fov_it->second.size() >= 3)
+                {
+                    for (int i = 0; i < 3; ++i)
+                    {
+                        try
+                        {
+                            fov_mm[i] = std::stof(fov_it->second[static_cast<size_t>(i)]) * 1000.0f;
+                        }
+                        catch (...)
+                        {
+                        }
+                    }
+                }
+                auto mat_it = defs.find(matrix_key);
+                if (mat_it != defs.end() && mat_it->second.size() >= 3)
+                {
+                    for (int i = 0; i < 3; ++i)
+                    {
+                        try
+                        {
+                            matrix[i] = std::stof(mat_it->second[static_cast<size_t>(i)]);
+                        }
+                        catch (...)
+                        {
+                        }
+                    }
+                }
+            };
+
             // encodedSpace, reconSpace and encodingLimits: one entry per encoding space
             for (int es = 0; es < num_es; ++es)
             {
                 const auto &ces = cache.encoding_spaces[es];
 
-                // FOV/matrix are per-encoding-space and already definition-sourced:
-                // the writer copies each subsequence's [DEFINITIONS] FOV/Matrix (and
-                // NavFOV/NavMatrix for the navigator ES) into the TRAJECTORY per-ES
-                // fov/matrix fields read into ces, with the N/N+1 split for PMC
-                // navigators handled there. So ces.fov/ces.matrix are authoritative.
+                float fov_mm[3], matrix[3];
+                read_geometry(ces.subseq_idx, ces.geometry_tag, fov_mm, matrix);
+
                 ISMRMRD::EncodingSpace space;
-                space.matrixSize.x = static_cast<uint16_t>(ces.matrix[0]);
-                space.matrixSize.y = static_cast<uint16_t>(ces.matrix[1]);
-                space.matrixSize.z = static_cast<uint16_t>(ces.matrix[2]);
-                space.fieldOfView_mm.x = ces.fov[0];
-                space.fieldOfView_mm.y = ces.fov[1];
-                space.fieldOfView_mm.z = ces.fov[2];
+                space.matrixSize.x = static_cast<uint16_t>(matrix[0]);
+                space.matrixSize.y = static_cast<uint16_t>(matrix[1]);
+                space.matrixSize.z = static_cast<uint16_t>(matrix[2]);
+                space.fieldOfView_mm.x = fov_mm[0];
+                space.fieldOfView_mm.y = fov_mm[1];
+                space.fieldOfView_mm.z = fov_mm[2];
                 hdr.encoding[es].encodedSpace = space;
                 hdr.encoding[es].reconSpace = space;
 
@@ -1099,13 +977,14 @@ namespace mrdserver
         }
     }
 
-    ISMRMRD::Waveform make_physio_waveform(uint16_t waveform_id,
-                                           uint32_t measurement_uid,
-                                           uint32_t scan_counter,
-                                           uint32_t time_stamp_ms,
-                                           float sample_time_us,
-                                           const std::vector<const int16_t *> &channels,
-                                           uint16_t num_samples)
+    ISMRMRD::Waveform make_physio_waveform(
+        uint16_t waveform_id,
+        uint32_t measurement_uid,
+        uint32_t scan_counter,
+        uint32_t time_stamp_ms,
+        float sample_time_us,
+        const std::vector<const int16_t *> &channels,
+        uint16_t num_samples)
     {
         const uint16_t num_channels = static_cast<uint16_t>(channels.size());
         ISMRMRD::Waveform wav(num_samples, num_channels);
@@ -1126,8 +1005,7 @@ namespace mrdserver
             const int16_t *src = channels[ch];
             for (uint16_t s = 0; s < num_samples; ++s)
             {
-                dst[static_cast<size_t>(ch) * num_samples + s] =
-                    static_cast<uint32_t>(static_cast<int32_t>(src[s]));
+                dst[static_cast<size_t>(ch) * num_samples + s] = static_cast<uint32_t>(static_cast<int32_t>(src[s]));
             }
         }
         return wav;
@@ -1168,10 +1046,7 @@ namespace mrdserver
     // Sequence-description waveform factory functions
     // ================================================================
 
-    ISMRMRD::Waveform make_seqdesc_header_waveform(
-        const SequenceCache &cache,
-        uint32_t measurement_uid,
-        uint32_t scan_counter)
+    ISMRMRD::Waveform make_seqdesc_header_waveform(const SequenceCache &cache, uint32_t measurement_uid, uint32_t scan_counter)
     {
         const auto &sp = cache.seq_params;
         std::vector<uint32_t> p;
@@ -1182,14 +1057,10 @@ namespace mrdserver
         p.push_back(f2u(sp.max_tr_us));
         p.push_back(f2u(sp.max_flip_angle_deg));
         p.push_back(f2u(sp.total_scan_time_us));
-        return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_HEADER,
-                                           measurement_uid, scan_counter, p);
+        return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_HEADER, measurement_uid, scan_counter, p);
     }
 
-    ISMRMRD::Waveform make_seqdesc_events_waveform(
-        const SequenceDescription &desc,
-        uint32_t measurement_uid,
-        uint32_t scan_counter)
+    ISMRMRD::Waveform make_seqdesc_events_waveform(const SequenceDescription &desc, uint32_t measurement_uid, uint32_t scan_counter)
     {
         // Header: subseq_idx, tr_duration_us, num_events
         // Per event: type (int as uint32), timestamp_us (float), params[7] (float x7)
@@ -1206,48 +1077,63 @@ namespace mrdserver
             for (int i = 0; i < 7; ++i)
                 p.push_back(f2u(ev.params[i]));
         }
-        return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_EVENTS,
-                                           measurement_uid, scan_counter, p);
+        return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_EVENTS, measurement_uid, scan_counter, p);
     }
 
-    ISMRMRD::Waveform make_seqdesc_rf_shapes_waveform(
-        const SequenceDescription &desc,
-        uint32_t measurement_uid,
-        uint32_t scan_counter)
+    ISMRMRD::Waveform make_seqdesc_rf_shapes_waveform(const SequenceDescription &desc, uint32_t measurement_uid, uint32_t scan_counter)
     {
-        // Header: subseq_idx, num_tuples
-        // Per tuple (all as uint32 bit-cast floats or raw ints):
-        //   tuple_id (int), rf_def_id (int), rf_shim_id (int),
-        //   ss_grad_amp_hz_per_m (float), slice_thickness_mm (float),
-        //   slice_selective (int)
+        // Stage 1.5d: emit the REAL (still-compressed) per-rf_def shapes from
+        // desc.rf_defs -- see the header doc comment for the exact wire format.
         std::vector<uint32_t> p;
         p.push_back(static_cast<uint32_t>(desc.subseq_idx));
-        p.push_back(static_cast<uint32_t>(desc.rf_shape_tuples.size()));
-        for (const auto &t : desc.rf_shape_tuples)
+        p.push_back(static_cast<uint32_t>(desc.rf_defs.size()));
+
+        auto push_shape_header = [&](const RfShapeSamples &shape)
         {
-            p.push_back(static_cast<uint32_t>(t.tuple_id));
-            p.push_back(static_cast<uint32_t>(t.rf_def_id));
-            p.push_back(static_cast<uint32_t>(t.rf_shim_id));
-            p.push_back(f2u(t.ss_grad_amp_hz_per_m));
-            p.push_back(f2u(t.slice_thickness_mm));
-            p.push_back(static_cast<uint32_t>(t.slice_selective));
+            p.push_back(static_cast<uint32_t>(shape.num_uncompressed));
+            p.push_back(static_cast<uint32_t>(shape.samples.size()));
+        };
+        auto push_shape_samples = [&](const RfShapeSamples &shape)
+        {
+            for (float v : shape.samples)
+                p.push_back(f2u(v));
+        };
+
+        for (const auto &def : desc.rf_defs)
+        {
+            p.push_back(static_cast<uint32_t>(def.rf_def_id));
+            p.push_back(f2u(def.bandwidth_hz));
+            p.push_back(static_cast<uint32_t>(def.num_bands));
+            for (int b = 0; b < 8; ++b)
+                p.push_back(f2u(def.band_freq_offsets_hz[b]));
+            p.push_back(f2u(def.band_bandwidth_hz));
+            p.push_back(f2u(def.total_b1sq_power));
+
+            push_shape_header(def.mag);
+            p.push_back(static_cast<uint32_t>(def.has_phase ? 1 : 0));
+            if (def.has_phase)
+                push_shape_header(def.phase);
+            p.push_back(static_cast<uint32_t>(def.has_time ? 1 : 0));
+            if (def.has_time)
+                push_shape_header(def.time);
+
+            push_shape_samples(def.mag);
+            if (def.has_phase)
+                push_shape_samples(def.phase);
+            if (def.has_time)
+                push_shape_samples(def.time);
         }
-        return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_RF_SHAPES,
-                                           measurement_uid, scan_counter, p);
+        return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_RF_SHAPES, measurement_uid, scan_counter, p);
     }
 
-    ISMRMRD::Waveform make_seqdesc_shims_waveform(
-        const SequenceDescription &desc,
-        uint32_t measurement_uid,
-        uint32_t scan_counter)
+    ISMRMRD::Waveform make_seqdesc_shims_waveform(const SequenceDescription &desc, uint32_t measurement_uid, uint32_t scan_counter)
     {
         // Shim definitions are no longer stored in Section 5 of the cache.
         // Emit a minimal waveform with just the subseq header and zero shim count.
         std::vector<uint32_t> p;
         p.push_back(static_cast<uint32_t>(desc.subseq_idx));
         p.push_back(0u); // num_shims = 0
-        return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_SHIMS,
-                                           measurement_uid, scan_counter, p);
+        return make_float_payload_waveform(WAVEFORM_ID_SEQDESC_SHIMS, measurement_uid, scan_counter, p);
     }
 
 } // namespace mrdserver
